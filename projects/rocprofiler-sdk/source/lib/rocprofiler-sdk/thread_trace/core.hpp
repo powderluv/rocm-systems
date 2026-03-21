@@ -150,9 +150,7 @@ public:
                                                     rocprofiler_user_data_t*       user_data,
                                                     const context::correlation_id* corr_id);
 
-    void        post_kernel_call(inst_pkt_t&                      aql,
-                                 const hsa::queue_info_session_t& session,
-                                 const hsa::packet_data_t&        packet_data);
+    void        post_kernel_call(inst_pkt_t& aql, const hsa::queue_info_session& session);
     const auto& get_agents() const { return agents; }
 
 private:

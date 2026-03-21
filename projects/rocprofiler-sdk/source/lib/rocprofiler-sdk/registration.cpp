@@ -975,31 +975,86 @@ finalize()
     // above returns true for all invocations after the first one
 
     ROCP_INFO << "finalizing rocprofiler (value=" << get_fini_status() << ")";
+    std::fprintf(stderr, "[rocprofiler-sdk][finalize] begin\n");
+    std::fflush(stderr);
 
     static auto _once = std::once_flag{};
     std::call_once(_once, []() {
         auto num_clients = get_num_clients();
         set_fini_status(-1);
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] async_copy_fini begin\n");
+        std::fflush(stderr);
         hsa::async_copy_fini();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] async_copy_fini end\n");
+        std::fflush(stderr);
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] device_counting_service_finalize begin\n");
+        std::fflush(stderr);
         counters::device_counting_service_finalize();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] device_counting_service_finalize end\n");
+        std::fflush(stderr);
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] queue_controller_fini begin\n");
+        std::fflush(stderr);
         hsa::queue_controller_fini();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] queue_controller_fini end\n");
+        std::fflush(stderr);
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] thread_trace_finalize begin\n");
+        std::fflush(stderr);
         thread_trace::finalize();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] thread_trace_finalize end\n");
+        std::fflush(stderr);
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] ompt_finalize begin\n");
+        std::fflush(stderr);
         ompt::finalize_ompt();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] ompt_finalize end\n");
+        std::fflush(stderr);
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] kfd_finalize begin\n");
+        std::fflush(stderr);
         kfd::finalize();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] kfd_finalize end\n");
+        std::fflush(stderr);
 #if ROCPROFILER_SDK_HSA_PC_SAMPLING > 0
         // WARNING: this must precede `code_object::finalize()`
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] pc_sampling_code_object_finalize begin\n");
+        std::fflush(stderr);
         pc_sampling::code_object::finalize();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] pc_sampling_code_object_finalize end\n");
+        std::fflush(stderr);
         // WARNING: this must follows queue_controller_fini.
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] pc_sampling_service_fini begin\n");
+        std::fflush(stderr);
         pc_sampling::service_fini();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] pc_sampling_service_fini end\n");
+        std::fflush(stderr);
 #endif
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] code_object_finalize begin\n");
+        std::fflush(stderr);
         code_object::finalize();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] code_object_finalize end\n");
+        std::fflush(stderr);
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] correlation_id_finalize begin\n");
+        std::fflush(stderr);
         context::correlation_id_finalize();
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] correlation_id_finalize end\n");
+        std::fflush(stderr);
         if(get_init_status() > 0)
         {
+            std::fprintf(stderr, "[rocprofiler-sdk][finalize] invoke_client_finalizers begin\n");
+            std::fflush(stderr);
             invoke_client_finalizers();
+            std::fprintf(stderr, "[rocprofiler-sdk][finalize] invoke_client_finalizers end\n");
+            std::fflush(stderr);
         }
-        if(num_clients > 0) internal_threading::finalize();
+        if(num_clients > 0)
+        {
+            std::fprintf(stderr, "[rocprofiler-sdk][finalize] internal_threading_finalize begin\n");
+            std::fflush(stderr);
+            internal_threading::finalize();
+            std::fprintf(stderr, "[rocprofiler-sdk][finalize] internal_threading_finalize end\n");
+            std::fflush(stderr);
+        }
         set_fini_status(1);
+        std::fprintf(stderr, "[rocprofiler-sdk][finalize] end\n");
+        std::fflush(stderr);
     });
 
 #if defined(CODECOV) && CODECOV > 0
@@ -1059,16 +1114,24 @@ rocprofiler_force_configure(rocprofiler_configure_func_t configure_func)
     forced_config = configure_func;
     rocprofiler::registration::initialize();
 
-    // Trigger re-propagation of all registered API tables via rocprofiler-register.
-    // This enables late-start profiling where runtimes may have already initialized
-    // and registered their API tables before rocprofiler-sdk was loaded.
-    auto status = rocprofiler::registration::late::invoke_register_propagation();
-    if(status != ROCPROFILER_STATUS_SUCCESS)
+    // Late-start API-table re-propagation regressed kernel-trace stability for HIP-graph
+    // workloads in local validation. Keep it opt-in until the registration lifetime issue
+    // is resolved.
+    auto enable_late_register_propagation =
+        rocprofiler::common::get_env("ROCPROFILER_ENABLE_LATE_REGISTER_PROPAGATION", false);
+    if(enable_late_register_propagation)
     {
-        ROCP_WARNING << "Failed to invoke rocprofiler-register propagation. "
-                     << "This is normal if runtimes have not initialized yet, or if "
-                     << "rocprofiler-register is not loaded. Runtimes that initialize "
-                     << "after this call will be automatically profiled.";
+        // Trigger re-propagation of all registered API tables via rocprofiler-register.
+        // This enables late-start profiling where runtimes may have already initialized
+        // and registered their API tables before rocprofiler-sdk was loaded.
+        auto status = rocprofiler::registration::late::invoke_register_propagation();
+        if(status != ROCPROFILER_STATUS_SUCCESS)
+        {
+            ROCP_WARNING << "Failed to invoke rocprofiler-register propagation. "
+                         << "This is normal if runtimes have not initialized yet, or if "
+                         << "rocprofiler-register is not loaded. Runtimes that initialize "
+                         << "after this call will be automatically profiled.";
+        }
     }
 
     return ROCPROFILER_STATUS_SUCCESS;

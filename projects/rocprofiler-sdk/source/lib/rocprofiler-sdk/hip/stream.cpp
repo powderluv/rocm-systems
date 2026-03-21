@@ -409,8 +409,6 @@ namespace
 bool
 enable_stream_stack()
 {
-    if(hsa::enable_queue_intercept()) return true;
-
     for(const auto& itr : context::get_registered_contexts())
     {
         if(itr->is_tracing_one_of(ROCPROFILER_CALLBACK_TRACING_MEMORY_COPY,

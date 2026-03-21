@@ -360,9 +360,8 @@ DispatchThreadTracer::pre_kernel_call(const hsa::Queue&              queue,
 }
 
 void
-DispatchThreadTracer::post_kernel_call(DispatchThreadTracer::inst_pkt_t& aql,
-                                       const hsa::queue_info_session_t& /*session*/,
-                                       const hsa::packet_data_t& packet_data)
+DispatchThreadTracer::post_kernel_call(DispatchThreadTracer::inst_pkt_t&       aql,
+                                       const hsa::Queue::queue_info_session_t& session)
 {
     if(post_move_data.load() < 1) return;
 
@@ -378,14 +377,14 @@ DispatchThreadTracer::post_kernel_call(DispatchThreadTracer::inst_pkt_t& aql,
 
         auto it = agents.find(pkt->GetAgent());
         if(it != agents.end() && it->second != nullptr)
-            it->second->iterate_data(pkt->GetHandle(), packet_data.user_data);
+            it->second->iterate_data(pkt->GetHandle(), session.user_data);
     }
 }
 
 void
 DispatchThreadTracer::start_context()
 {
-    using corr_id_map_t = hsa::queue_info_session_t::external_corr_id_map_t;
+    using corr_id_map_t = hsa::Queue::queue_info_session_t::external_corr_id_map_t;
 
     CHECK_NOTNULL(hsa::get_queue_controller())->enable_serialization();
 
@@ -408,11 +407,10 @@ DispatchThreadTracer::start_context()
                     },
                     [=](const hsa::Queue& /* q */,
                         hsa::rocprofiler_packet /* kern_pkt */,
-                        std::shared_ptr<hsa::queue_info_session_t>& session,
-                        hsa::packet_data_t&                         packet_data,
-                        inst_pkt_t&                                 aql,
+                        std::shared_ptr<hsa::Queue::queue_info_session_t>& session,
+                        inst_pkt_t&                                        aql,
                         kernel_dispatch::profiling_time) {
-                        this->post_kernel_call(aql, *session, packet_data);
+                        this->post_kernel_call(aql, *session);
                     });
     });
 }

@@ -22,7 +22,11 @@
 
 #pragma once
 
-#include "lib/common/container/pool_object.hpp"
+#include <rocprofiler-sdk/agent.h>
+#include <rocprofiler-sdk/buffer_tracing.h>
+#include <rocprofiler-sdk/callback_tracing.h>
+#include <rocprofiler-sdk/fwd.h>
+
 #include "lib/common/container/small_vector.hpp"
 #include "lib/common/synchronized.hpp"
 #include "lib/rocprofiler-sdk/hsa/agent_cache.hpp"
@@ -30,11 +34,6 @@
 #include "lib/rocprofiler-sdk/hsa/queue_info_session.hpp"
 #include "lib/rocprofiler-sdk/hsa/rocprofiler_packet.hpp"
 #include "lib/rocprofiler-sdk/kernel_dispatch/profiling_time.hpp"
-
-#include <rocprofiler-sdk/agent.h>
-#include <rocprofiler-sdk/buffer_tracing.h>
-#include <rocprofiler-sdk/callback_tracing.h>
-#include <rocprofiler-sdk/fwd.h>
 
 #include <hsa/amd_hsa_kernel_code.h>
 #include <hsa/hsa.h>
@@ -44,10 +43,14 @@
 #include <hsa/hsa_ven_amd_loader.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace rocprofiler
 {
@@ -58,6 +61,8 @@ struct correlation_id;
 }  // namespace context
 namespace hsa
 {
+struct async_signal_slot;
+
 enum class queue_state
 {
     normal       = 0,
@@ -69,17 +74,16 @@ enum class queue_state
 class Queue
 {
 public:
-    using context_t       = context::context;
-    using context_array_t = common::container::small_vector<const context_t*>;
-    using callback_t      = void (*)(hsa_status_t status, hsa_queue_t* source, void* data);
+    using context_t            = context::context;
+    using context_array_t      = common::container::small_vector<const context_t*>;
+    using callback_t           = void (*)(hsa_status_t status, hsa_queue_t* source, void* data);
+    using queue_info_session_t = queue_info_session;
 
     struct pkt_and_serialize_t
     {
         std::unique_ptr<AQLPacket> pkt{nullptr};
         bool                       request_serialize{false};
     };
-
-    using pooled_signal_t = common::container::pool_object<signal_t>;
 
     // Function prototype used to notify consumers that a kernel has been enqueued.
     // Pair first: An AQL packet can be returned that will be injected into the queue.
@@ -95,8 +99,7 @@ public:
     // Signals the completion of the kernel packet.
     using completed_cb_t = std::function<void(const Queue&,
                                               const rocprofiler_packet&,
-                                              std::shared_ptr<queue_info_session_t>&,
-                                              packet_data_t&,
+                                              std::shared_ptr<Queue::queue_info_session_t>&,
                                               inst_pkt_t&,
                                               kernel_dispatch::profiling_time)>;
     using callback_map_t = std::unordered_map<ClientID, std::pair<queue_cb_t, completed_cb_t>>;
@@ -129,10 +132,15 @@ public:
     const hsa_queue_t*        intercept_queue() const { return _intercept_queue; };
     virtual const AgentCache& get_agent() const { return _agent; }
 
-    void signal_async_handler(pooled_signal_t* _signal, hsa_signal_t raw_signal, void* data) const;
-    static pooled_signal_t* create_signal(uint32_t attribute, hsa_signal_t* _signal, bool use_pool);
-    static void             release_signal(pooled_signal_t* signal);
-    static void             destroy_signal(pooled_signal_t* signal);
+    void create_signal(uint32_t attribute, hsa_signal_t* signal, bool direct_path = false) const;
+    void signal_async_handler(const hsa_signal_t& signal, void* data) const;
+    async_signal_slot* acquire_async_signal_slot() const;
+    void               arm_async_signal_slot(async_signal_slot*                   slot,
+                                             std::shared_ptr<queue_info_session_t> session) const;
+    void retire_signal(hsa_signal_t signal) const;
+    void drain_retired_signals() const;
+    void destroy_async_signal_slots() const;
+    void complete_async_signal_slot(async_signal_slot* slot) const;
 
     template <typename FuncT>
     void signal_callback(FuncT&& func) const;
@@ -148,8 +156,33 @@ public:
     // Tracks the number of in flight kernel executions we
     // are waiting on. We cannot destroy Queue until all kernels
     // have comleted.
-    void    async_started() { _core_api.hsa_signal_add_relaxed_fn(_active_kernels, 1); }
-    void    async_complete() { _core_api.hsa_signal_subtract_relaxed_fn(_active_kernels, 1); }
+    void    interceptor_started()
+    {
+        _active_async_packets.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void interceptor_complete()
+    {
+        _active_async_packets.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    int64_t active_interceptors() const
+    {
+        return _active_async_packets.load(std::memory_order_acquire);
+    }
+    void async_handler_started()
+    {
+        _active_async_handlers.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void async_handler_complete()
+    {
+        _active_async_handlers.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    int64_t active_async_handlers() const
+    {
+        return _active_async_handlers.load(std::memory_order_acquire);
+    }
+    void async_started() { _core_api.hsa_signal_add_relaxed_fn(_active_kernels, 1); }
+    void async_complete() { _core_api.hsa_signal_subtract_relaxed_fn(_active_kernels, 1); }
+    bool has_active_kernel_signal() const { return _active_kernels.handle != 0u; }
     int64_t active_async_packets() const
     {
         return _core_api.hsa_signal_load_scacquire_fn(_active_kernels);
@@ -159,27 +192,83 @@ public:
     void register_callback(ClientID id, queue_cb_t enqueue_cb, completed_cb_t complete_cb);
     void remove_callback(ClientID id);
 
-    const CoreApiTable& core_api() const { return _core_api; }
-    const AmdExtTable&  ext_api() const { return _ext_api; }
-    queue_state         get_state() const;
-    void                set_state(queue_state state);
-
-    mutable std::mutex              cv_mutex        = {};
-    mutable std::condition_variable cv_ready_signal = {};
-    hsa_signal_t                    block_signal    = {.handle = 0};
-    hsa_signal_t                    ready_signal    = {.handle = 0};
+    const CoreApiTable&             core_api() const { return _core_api; }
+    const AmdExtTable&              ext_api() const { return _ext_api; }
+    mutable std::mutex              cv_mutex;
+    mutable std::condition_variable cv_ready_signal;
+    hsa_signal_t                    block_signal;
+    hsa_signal_t                    ready_signal;
+    queue_state                     get_state() const;
+    void                            set_state(queue_state state) const;
 
 private:
-    std::atomic<int>                     _notifiers            = {0};
-    std::atomic<int64_t>                 _active_async_packets = {0};
-    CoreApiTable                         _core_api             = {};
-    AmdExtTable                          _ext_api              = {};
+    struct queue_signal_trace_stats_t
+    {
+        std::atomic<uint64_t> create_signal_calls          = {0};
+        std::atomic<uint64_t> create_signal_total_ns       = {0};
+        std::atomic<uint64_t> create_signal_max_ns         = {0};
+        std::atomic<uint64_t> direct_create_signal_calls   = {0};
+        std::atomic<uint64_t> async_register_calls         = {0};
+        std::atomic<uint64_t> async_register_total_ns      = {0};
+        std::atomic<uint64_t> async_register_max_ns        = {0};
+        std::atomic<uint64_t> slot_prepare_calls           = {0};
+        std::atomic<uint64_t> slot_prepare_total_ns        = {0};
+        std::atomic<uint64_t> slot_prepare_max_ns          = {0};
+        std::atomic<uint64_t> slot_builder_loops           = {0};
+        std::atomic<uint64_t> slot_builder_create_attempts = {0};
+        std::atomic<uint64_t> slot_builder_created         = {0};
+        std::atomic<uint64_t> slot_acquire_attempts        = {0};
+        std::atomic<uint64_t> slot_acquire_hits            = {0};
+        std::atomic<uint64_t> slot_acquire_misses          = {0};
+        std::atomic<uint64_t> slot_arm_calls               = {0};
+        std::atomic<uint64_t> slot_complete_calls          = {0};
+        std::atomic<uint64_t> retired_signal_calls         = {0};
+        std::atomic<uint64_t> retired_signal_drained       = {0};
+        std::atomic<uint64_t> pool_slots_last              = {0};
+        std::atomic<uint64_t> pool_slots_max               = {0};
+        std::atomic<uint64_t> pool_ready_last              = {0};
+        std::atomic<uint64_t> pool_ready_max               = {0};
+        std::atomic<uint64_t> pool_in_use_last             = {0};
+        std::atomic<uint64_t> pool_in_use_max              = {0};
+        std::atomic<uint64_t> pool_tombstones_last         = {0};
+        std::atomic<uint64_t> pool_tombstones_max          = {0};
+    };
+
+    void ensure_async_signal_slot_builder_started() const;
+    void notify_async_signal_slot_builder() const;
+    void stop_async_signal_slot_builder() const;
+    void build_async_signal_slots() const;
+    void fill_async_signal_slots(uint64_t target_slots) const;
+    void prepare_async_signal_slot(async_signal_slot* slot) const;
+    void emit_queue_signal_trace(const char* reason) const;
+    void maybe_emit_queue_signal_trace(const char* reason, uint64_t count) const;
+    void update_queue_signal_pool_state(uint64_t total_slots,
+                                        uint64_t ready_slots,
+                                        uint64_t in_use_slots,
+                                        uint64_t tombstone_slots) const;
+
+    std::atomic<int>                     _notifiers             = {0};
+    std::atomic<int64_t>                 _active_async_handlers = {0};
+    std::atomic<int64_t>                 _active_async_packets  = {0};
+    CoreApiTable                         _core_api              = {};
+    AmdExtTable                          _ext_api               = {};
     const AgentCache&                    _agent;
-    common::Synchronized<callback_map_t> _callbacks       = {};
-    hsa_queue_t*                         _intercept_queue = nullptr;
-    queue_state                          _state           = queue_state::normal;
-    std::mutex                           _lock_queue      = {};
-    hsa_signal_t                         _active_kernels  = {.handle = 0};
+    common::Synchronized<callback_map_t> _callbacks            = {};
+    hsa_queue_t*                         _intercept_queue      = nullptr;
+    mutable std::atomic<queue_state>     _state                = queue_state::normal;
+    mutable std::mutex                   _retired_signals_mutex;
+    mutable std::vector<hsa_signal_t>    _retired_signals      = {};
+    mutable std::mutex                   _async_signal_slots_mutex;
+    mutable std::vector<std::unique_ptr<async_signal_slot>> _async_signal_slots = {};
+    mutable std::mutex                   _async_signal_slot_builder_mutex;
+    mutable std::condition_variable      _async_signal_slot_builder_cv = {};
+    mutable std::thread                  _async_signal_slot_builder = {};
+    mutable std::atomic<bool>            _async_signal_slot_builder_shutdown = {false};
+    mutable std::atomic<bool>            _async_signal_slot_builder_started = {false};
+    mutable std::atomic<bool>            _async_signal_slot_builder_requested = {false};
+    mutable queue_signal_trace_stats_t   _queue_signal_trace = {};
+    std::mutex                           _lock_queue;
+    hsa_signal_t                         _active_kernels = {.handle = 0};
 };
 
 inline rocprofiler_queue_id_t
