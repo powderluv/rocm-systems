@@ -30,6 +30,9 @@
 
 #include <rocprofiler-sdk/fwd.h>
 
+#include <unordered_map>
+#include <vector>
+
 namespace rocprofiler
 {
 namespace context
@@ -44,11 +47,40 @@ get_correlation_id_map()
     return _v;
 }
 
+auto*&
+get_thread_correlation_depth_map()
+{
+    using data_type = std::unordered_map<rocprofiler_thread_id_t, size_t>;
+    static auto*& _v = common::static_object<common::Synchronized<data_type>>::construct();
+    return _v;
+}
+
 auto&
 get_latest_correlation_id_impl()
 {
-    static thread_local auto _v = common::container::small_vector<correlation_id*, 16>{};
+    static thread_local auto _v = std::vector<correlation_id*>{};
     return _v;
+}
+
+auto*&
+get_latest_correlation_id_ptr_impl()
+{
+    static thread_local auto* _v = static_cast<correlation_id*>(nullptr);
+    return _v;
+}
+
+void
+update_thread_correlation_depth(rocprofiler_thread_id_t tid, size_t depth)
+{
+    auto* depth_map = get_thread_correlation_depth_map();
+    if(!depth_map) return;
+
+    depth_map->wlock([tid, depth](auto& data) {
+        if(depth == 0)
+            data.erase(tid);
+        else
+            data[tid] = depth;
+    });
 }
 
 uint64_t
@@ -160,6 +192,8 @@ correlation_tracing_service::construct(uint32_t _init_ref_count)
         ret->ancestor = prev_api_corr_id->internal;
 
     get_latest_correlation_id_impl().emplace_back(ret.get());
+    get_latest_correlation_id_ptr_impl() = ret.get();
+    update_thread_correlation_depth(ret->thread_idx, get_latest_correlation_id_impl().size());
 
     return ret.get();
 }
@@ -167,8 +201,19 @@ correlation_tracing_service::construct(uint32_t _init_ref_count)
 correlation_id*
 get_latest_correlation_id()
 {
-    return (get_latest_correlation_id_impl().empty()) ? nullptr
-                                                      : get_latest_correlation_id_impl().back();
+    return get_latest_correlation_id_ptr_impl();
+}
+
+bool
+thread_has_correlation_id(rocprofiler_thread_id_t tid)
+{
+    auto* depth_map = get_thread_correlation_depth_map();
+    if(!depth_map) return false;
+
+    return depth_map->rlock([tid](const auto& data) {
+        auto itr = data.find(tid);
+        return itr != data.end() && itr->second > 0;
+    });
 }
 
 const correlation_id*
@@ -192,8 +237,10 @@ pop_latest_correlation_id(correlation_id* val)
         << ". top of stack is " << get_latest_correlation_id_impl().back()->internal;
 
     stack.pop_back();
+    get_latest_correlation_id_ptr_impl() = (stack.empty()) ? nullptr : stack.back();
+    update_thread_correlation_depth(val->thread_idx, stack.size());
 
-    return (stack.empty()) ? nullptr : stack.back();
+    return get_latest_correlation_id_ptr_impl();
 }
 
 correlation_id*
@@ -207,6 +254,8 @@ push_correlation_id(correlation_id* val)
 
     val->thread_idx = common::get_tid();
     get_latest_correlation_id_impl().emplace_back(val);
+    get_latest_correlation_id_ptr_impl() = val;
+    update_thread_correlation_depth(val->thread_idx, get_latest_correlation_id_impl().size());
 
     return val;
 }

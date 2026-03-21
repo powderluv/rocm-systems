@@ -79,6 +79,9 @@ private:
 correlation_id*
 get_latest_correlation_id();
 
+bool
+thread_has_correlation_id(rocprofiler_thread_id_t);
+
 const correlation_id*
 pop_latest_correlation_id(correlation_id*);
 

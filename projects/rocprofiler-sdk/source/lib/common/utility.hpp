@@ -65,6 +65,12 @@ get_tid()
 }
 
 inline uint64_t
+get_tid_no_cache()
+{
+    return ::syscall(__NR_gettid);
+}
+
+inline uint64_t
 get_ticks(clockid_t clk_id_v) noexcept
 {
     constexpr auto nanosec = std::nano::den;

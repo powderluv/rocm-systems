@@ -22,6 +22,7 @@
 
 #include "lib/rocprofiler-sdk/code_object/code_object.hpp"
 #include "lib/common/logging.hpp"
+#include "lib/common/environment.hpp"
 #include "lib/common/scope_destructor.hpp"
 #include "lib/common/static_object.hpp"
 #include "lib/common/string_entry.hpp"
@@ -43,9 +44,11 @@
 #include <hsa/hsa_api_trace.h>
 #include <hsa/hsa_ven_amd_loader.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -62,7 +65,7 @@ namespace
 {
 using context_t              = context::context;
 using context_array_t        = common::container::small_vector<const context_t*>;
-using external_corr_id_map_t = tracing::external_correlation_id_map_t;
+using external_corr_id_map_t = std::unordered_map<const context_t*, rocprofiler_user_data_t>;
 
 template <size_t OpIdx>
 struct code_object_info;
@@ -375,6 +378,108 @@ using kernel_object_map_t        = std::unordered_map<uint64_t, uint64_t>;
 using executable_array_t         = std::vector<hsa_executable_t>;
 using code_object_unload_array_t = std::vector<hsa::code_object_unload>;
 
+struct kernel_object_lookup_cache_entry_t
+{
+    std::atomic<uint64_t> kernel_object = {0};
+    std::atomic<uint64_t> kernel_id     = {0};
+};
+
+constexpr size_t kernel_object_lookup_cache_size = 256;
+
+struct code_object_trace_stats_t
+{
+    std::atomic<uint64_t> inserts{0};
+    std::atomic<uint64_t> lookups{0};
+    std::atomic<uint64_t> lookup_hits{0};
+    std::atomic<uint64_t> lookup_misses{0};
+    std::atomic<uint64_t> lookup_after_shutdown{0};
+    std::atomic<uint64_t> erase_attempts{0};
+    std::atomic<uint64_t> erase_hits{0};
+    std::atomic<uint64_t> erase_misses{0};
+    std::atomic<uint64_t> erase_key_mismatch_hits{0};
+    std::atomic<uint64_t> executable_destroy_calls{0};
+    std::atomic<uint64_t> shutdown_calls{0};
+    std::atomic<uint64_t> map_size_last{0};
+    std::atomic<uint64_t> map_size_max{0};
+    std::atomic<uint64_t> last_lookup_kernel_object{0};
+    std::atomic<uint64_t> last_miss_kernel_object{0};
+    std::atomic<uint64_t> last_insert_kernel_object{0};
+    std::atomic<uint64_t> last_erase_kernel_object{0};
+    std::atomic<uint64_t> last_erase_kernel_id{0};
+};
+
+template <typename Tp>
+void
+update_atomic_max(std::atomic<Tp>& dst, Tp value)
+{
+    auto current = dst.load(std::memory_order_relaxed);
+    while(current < value &&
+          !dst.compare_exchange_weak(
+              current, value, std::memory_order_relaxed, std::memory_order_relaxed))
+    {}
+}
+
+bool
+code_object_trace_enabled()
+{
+    static const auto _v = common::get_env("ROCPROFILER_CODE_OBJECT_TRACE", false);
+    return _v;
+}
+
+int
+code_object_trace_period()
+{
+    static const auto _v = std::max(0, common::get_env("ROCPROFILER_CODE_OBJECT_TRACE_PERIOD", 0));
+    return _v;
+}
+
+auto&
+get_code_object_trace_stats()
+{
+    static auto _v = code_object_trace_stats_t{};
+    return _v;
+}
+
+void
+emit_code_object_trace_summary(const char* reason)
+{
+    if(!code_object_trace_enabled()) return;
+
+    auto load = [](const std::atomic<uint64_t>& value) {
+        return static_cast<unsigned long long>(value.load(std::memory_order_relaxed));
+    };
+
+    const auto& stats = get_code_object_trace_stats();
+    std::fprintf(stderr,
+                 "ROCP code-object reason=%s inserts=%llu lookups=%llu lookup_hits=%llu "
+                 "lookup_misses=%llu lookup_after_shutdown=%llu erase_attempts=%llu "
+                 "erase_hits=%llu erase_misses=%llu erase_key_mismatch_hits=%llu "
+                 "destroy_calls=%llu shutdown_calls=%llu map_size_last=%llu map_size_max=%llu "
+                 "last_lookup_kernel_object=0x%llx last_miss_kernel_object=0x%llx "
+                 "last_insert_kernel_object=0x%llx last_erase_kernel_object=0x%llx "
+                 "last_erase_kernel_id=%llu\n",
+                 (reason != nullptr) ? reason : "unknown",
+                 load(stats.inserts),
+                 load(stats.lookups),
+                 load(stats.lookup_hits),
+                 load(stats.lookup_misses),
+                 load(stats.lookup_after_shutdown),
+                 load(stats.erase_attempts),
+                 load(stats.erase_hits),
+                 load(stats.erase_misses),
+                 load(stats.erase_key_mismatch_hits),
+                 load(stats.executable_destroy_calls),
+                 load(stats.shutdown_calls),
+                 load(stats.map_size_last),
+                 load(stats.map_size_max),
+                 load(stats.last_lookup_kernel_object),
+                 load(stats.last_miss_kernel_object),
+                 load(stats.last_insert_kernel_object),
+                 load(stats.last_erase_kernel_object),
+                 load(stats.last_erase_kernel_id));
+    std::fflush(stderr);
+}
+
 std::vector<hsa::code_object_unload>
 shutdown(hsa_executable_t executable);
 
@@ -408,6 +513,61 @@ get_kernel_object_map()
     static auto*& _v =
         common::static_object<common::Synchronized<kernel_object_map_t>>::construct();
     return _v;
+}
+
+auto&
+get_kernel_object_lookup_cache()
+{
+    static auto _v = std::array<kernel_object_lookup_cache_entry_t, kernel_object_lookup_cache_size>{};
+    return _v;
+}
+
+kernel_object_lookup_cache_entry_t&
+get_kernel_object_lookup_cache_entry(uint64_t kernel_object)
+{
+    return get_kernel_object_lookup_cache()[kernel_object % kernel_object_lookup_cache_size];
+}
+
+uint64_t
+get_cached_kernel_id(uint64_t kernel_object)
+{
+    if(kernel_object == 0) return 0;
+
+    auto& entry = get_kernel_object_lookup_cache_entry(kernel_object);
+    if(entry.kernel_object.load(std::memory_order_acquire) != kernel_object) return 0;
+    return entry.kernel_id.load(std::memory_order_relaxed);
+}
+
+void
+cache_kernel_id(uint64_t kernel_object, uint64_t kernel_id)
+{
+    if(kernel_object == 0 || kernel_id == 0) return;
+
+    auto& entry = get_kernel_object_lookup_cache_entry(kernel_object);
+    entry.kernel_id.store(kernel_id, std::memory_order_relaxed);
+    entry.kernel_object.store(kernel_object, std::memory_order_release);
+}
+
+void
+invalidate_cached_kernel_id(uint64_t kernel_object)
+{
+    if(kernel_object == 0) return;
+
+    auto& entry = get_kernel_object_lookup_cache_entry(kernel_object);
+    if(entry.kernel_object.load(std::memory_order_acquire) != kernel_object) return;
+
+    entry.kernel_object.store(0, std::memory_order_release);
+    entry.kernel_id.store(0, std::memory_order_relaxed);
+}
+
+void
+clear_cached_kernel_ids()
+{
+    for(auto& entry : get_kernel_object_lookup_cache())
+    {
+        entry.kernel_object.store(0, std::memory_order_release);
+        entry.kernel_id.store(0, std::memory_order_relaxed);
+    }
 }
 
 auto*
@@ -514,9 +674,21 @@ executable_iterate_agent_symbols_load_callback(hsa_executable_t        executabl
         ->wlock(
             [](kernel_object_map_t& object_map, uint64_t _kern_obj, uint64_t _kern_id) {
                 object_map[_kern_obj] = _kern_id;
+                if(code_object_trace_enabled())
+                {
+                    auto& stats = get_code_object_trace_stats();
+                    auto  count = stats.inserts.fetch_add(1, std::memory_order_relaxed) + 1;
+                    stats.last_insert_kernel_object.store(_kern_obj, std::memory_order_relaxed);
+                    stats.map_size_last.store(object_map.size(), std::memory_order_relaxed);
+                    update_atomic_max(stats.map_size_max, static_cast<uint64_t>(object_map.size()));
+                    auto period = code_object_trace_period();
+                    if(period > 0 && (count % period) == 0)
+                        emit_code_object_trace_summary("insert");
+                }
             },
             data.kernel_object,
             data.kernel_id);
+    cache_kernel_id(data.kernel_object, data.kernel_id);
 
     code_obj_v->symbols.emplace_back(std::make_unique<hsa::kernel_symbol>(std::move(symbol_v)));
 
@@ -985,6 +1157,10 @@ executable_destroy(hsa_executable_t executable)
     // 3. Race on end_notified flags (now atomic, but still need serialization for callbacks)
     auto _lk = std::unique_lock{get_destroy_mutex()};
 
+    if(code_object_trace_enabled())
+        get_code_object_trace_stats().executable_destroy_calls.fetch_add(
+            1, std::memory_order_relaxed);
+
     if(is_shutdown.load(std::memory_order_acquire)) return HSA_STATUS_SUCCESS;
 
     auto _unloaded = shutdown(executable);
@@ -992,15 +1168,45 @@ executable_destroy(hsa_executable_t executable)
     if(get_kernel_object_map())
     {
         CHECK_NOTNULL(get_kernel_object_map())->wlock([_unloaded](kernel_object_map_t& data) {
+            auto trace_enabled = code_object_trace_enabled();
+            auto& stats        = get_code_object_trace_stats();
             for(const auto& uitr : _unloaded)
             {
                 for(const auto& sitr : uitr.symbols)
                 {
-                    data.erase(sitr->rocp_data.kernel_id);
+                    const auto kernel_object = sitr->rocp_data.kernel_object;
+                    const auto kernel_id     = sitr->rocp_data.kernel_id;
+
+                    if(trace_enabled)
+                    {
+                        stats.erase_attempts.fetch_add(1, std::memory_order_relaxed);
+                        stats.last_erase_kernel_object.store(
+                            kernel_object, std::memory_order_relaxed);
+                        stats.last_erase_kernel_id.store(kernel_id, std::memory_order_relaxed);
+                        if(data.find(kernel_id) == data.end() &&
+                           data.find(kernel_object) != data.end())
+                            stats.erase_key_mismatch_hits.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    auto erased = data.erase(kernel_object);
+                    invalidate_cached_kernel_id(kernel_object);
+
+                    if(trace_enabled)
+                    {
+                        if(erased > 0)
+                            stats.erase_hits.fetch_add(erased, std::memory_order_relaxed);
+                        else
+                            stats.erase_misses.fetch_add(1, std::memory_order_relaxed);
+                        stats.map_size_last.store(data.size(), std::memory_order_relaxed);
+                        update_atomic_max(stats.map_size_max,
+                                          static_cast<uint64_t>(data.size()));
+                    }
                 }
             }
         });
     }
+
+    if(code_object_trace_enabled()) emit_code_object_trace_summary("destroy");
 
     if(get_code_objects())
     {
@@ -1090,6 +1296,9 @@ hip_register_function(void**       modules,
 std::vector<hsa::code_object_unload>
 shutdown(hsa_executable_t executable)
 {
+    if(code_object_trace_enabled())
+        get_code_object_trace_stats().shutdown_calls.fetch_add(1, std::memory_order_relaxed);
+
     ROCP_INFO << "running " << __FUNCTION__ << " (executable=" << executable.handle << ")...";
 
     auto _unloaded = code_object::get_unloaded_code_objects(executable);
@@ -1164,6 +1373,8 @@ shutdown(hsa_executable_t executable)
             sitr->end_notified = true;
     }
 
+    if(code_object_trace_enabled()) emit_code_object_trace_summary("shutdown");
+
     return _unloaded;
 }
 
@@ -1194,6 +1405,8 @@ void
 initialize(HsaApiTable* table)
 {
     auto& core_table = *table->core_;
+
+    if(code_object_trace_enabled()) emit_code_object_trace_summary("initialize-hsa");
 
     get_status_string_function() = core_table.hsa_status_string_fn;
 
@@ -1239,13 +1452,62 @@ initialize(HipCompilerDispatchTable* table)
 uint64_t
 get_kernel_id(uint64_t kernel_object)
 {
-    return CHECK_NOTNULL(get_kernel_object_map())
+    if(is_shutdown.load(std::memory_order_acquire))
+    {
+        if(code_object_trace_enabled())
+        {
+            auto& stats = get_code_object_trace_stats();
+            stats.lookup_after_shutdown.fetch_add(1, std::memory_order_relaxed);
+            stats.last_lookup_kernel_object.store(kernel_object, std::memory_order_relaxed);
+            auto period = code_object_trace_period();
+            auto count  = stats.lookup_after_shutdown.load(std::memory_order_relaxed);
+            if(period > 0 && (count % period) == 0)
+                emit_code_object_trace_summary("lookup-after-shutdown");
+        }
+        return 0;
+    }
+
+    if(auto cached_kernel_id = get_cached_kernel_id(kernel_object); cached_kernel_id != 0)
+        return cached_kernel_id;
+
+    auto kernel_id = CHECK_NOTNULL(get_kernel_object_map())
         ->rlock(
             [](const kernel_object_map_t& object_map, uint64_t _kern_obj) -> uint64_t {
+                if(code_object_trace_enabled())
+                {
+                    auto& stats = get_code_object_trace_stats();
+                    auto  count = stats.lookups.fetch_add(1, std::memory_order_relaxed) + 1;
+                    stats.last_lookup_kernel_object.store(_kern_obj, std::memory_order_relaxed);
+                    stats.map_size_last.store(object_map.size(), std::memory_order_relaxed);
+                    update_atomic_max(stats.map_size_max,
+                                      static_cast<uint64_t>(object_map.size()));
+
+                    auto itr = object_map.find(_kern_obj);
+                    if(itr == object_map.end())
+                    {
+                        stats.lookup_misses.fetch_add(1, std::memory_order_relaxed);
+                        stats.last_miss_kernel_object.store(_kern_obj, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        stats.lookup_hits.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    auto period = code_object_trace_period();
+                    if(period > 0 && (count % period) == 0)
+                        emit_code_object_trace_summary("lookup");
+
+                    return (itr == object_map.end()) ? 0 : itr->second;
+                }
+
                 auto itr = object_map.find(_kern_obj);
                 return (itr == object_map.end()) ? 0 : itr->second;
             },
             kernel_object);
+
+    cache_kernel_id(kernel_object, kernel_id);
+
+    return kernel_id;
 }
 
 void
@@ -1262,8 +1524,11 @@ finalize()
     });
 
     CHECK_NOTNULL(get_code_objects())->wlock([](code_object_array_t& data) { data.clear(); });
+    clear_cached_kernel_ids();
 
     is_shutdown.store(true, std::memory_order_release);
+
+    if(code_object_trace_enabled()) emit_code_object_trace_summary("finalize");
 }
 
 void

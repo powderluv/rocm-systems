@@ -145,6 +145,13 @@ get_dereference(Tp* ptr)
     return *CHECK_NOTNULL(ptr);
 }
 
+bool
+enable_hip_stream_display_service()
+{
+    const auto& cfg = tool::get_config();
+    return !cfg.group_by_queue && (cfg.pftrace_output || cfg.rocpd_output);
+}
+
 auto
 get_destructors_lock()
 {
@@ -358,6 +365,21 @@ get_client_ctx()
     return context_id;
 }
 
+bool
+tool_finalize_trace_enabled()
+{
+    static bool _v = tool::get_env("ROCPROFILER_TOOL_FINALIZE_TRACE", false);
+    return _v;
+}
+
+void
+emit_finalize_trace(std::string_view msg)
+{
+    if(!tool_finalize_trace_enabled()) return;
+    std::fprintf(stderr, "[rocprofv3][finalize] %.*s\n", static_cast<int>(msg.size()), msg.data());
+    std::fflush(stderr);
+}
+
 void
 set_contexts_active(const context_id_set_t& ctxs, const bool start)
 {
@@ -383,6 +405,7 @@ flush()
 {
     constexpr auto null_buffer_id = rocprofiler_buffer_id_t{.handle = 0};
 
+    emit_finalize_trace("flush begin");
     ROCP_INFO << "flushing buffers...";
     for(auto itr : get_buffers().as_array())
     {
@@ -393,6 +416,7 @@ flush()
         }
     }
     ROCP_INFO << "Buffers flushed";
+    emit_finalize_trace("flush end");
 }
 
 void
@@ -519,12 +543,17 @@ set_kernel_rename_and_stream_correlation_id(rocprofiler_thread_id_t  thr_id,
                                             rocprofiler_user_data_t* external_corr_id,
                                             void*                    user_data)
 {
+    // Queue writes can be intercepted on ROCr-managed async threads during graph replay.
+    // Those threads do not participate in the host-side correlation / stream naming services,
+    // so there is no valid rename or stream metadata to attach.
+    if(internal_corr_id == 0) return 1;
+
     // Check whether services are enabled
     const bool kernel_rename_service_enabled =
         kind == ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_KERNEL_DISPATCH &&
         thread_dispatch_rename != nullptr && !thread_dispatch_rename->empty();
 
-    const bool hip_stream_enabled = rocprofiler::tool::stream::stream_stack_not_null();
+    const bool hip_stream_enabled = enable_hip_stream_display_service();
 
     if(!kernel_rename_service_enabled && !hip_stream_enabled) return 1;
 
@@ -1923,6 +1952,11 @@ wait_peer_finished(const pid_t& pid, const pid_t& ppid)
 void
 finalize_rocprofv3(std::string_view context)
 {
+    std::fprintf(stderr,
+                 "[rocprofv3][finalize] finalize_rocprofv3 begin context=%.*s\n",
+                 static_cast<int>(context.size()),
+                 context.data());
+    std::fflush(stderr);
     ROCP_INFO << "invoked: finalize_rocprofv3";
     if(client_finalizer && client_identifier)
     {
@@ -1935,6 +1969,11 @@ finalize_rocprofv3(std::string_view context)
     {
         ROCP_INFO << "finalize_rocprofv3('" << context << "') ignored: already finalized";
     }
+    std::fprintf(stderr,
+                 "[rocprofv3][finalize] finalize_rocprofv3 end context=%.*s\n",
+                 static_cast<int>(context.size()),
+                 context.data());
+    std::fflush(stderr);
 }
 
 bool
@@ -2528,22 +2567,26 @@ tool_init(rocprofiler_client_finalize_t fini_func, void* tool_data)
 
     start_context(rename_ctx, "kernel rename");
 
-    // Track stream ID information via callback service
-    auto hip_stream_display_ctx = rocprofiler_context_id_t{0};
+    if(enable_hip_stream_display_service())
+    {
+        // CSV/JSON traces tolerate a zero stream-id, so keep the HIP stream wrappers out of the
+        // hot path unless an output mode consumes stream correlation.
+        auto hip_stream_display_ctx = rocprofiler_context_id_t{0};
 
-    ROCPROFILER_CALL(rocprofiler_create_context(&hip_stream_display_ctx),
-                     "failed to create hip stream context");
+        ROCPROFILER_CALL(rocprofiler_create_context(&hip_stream_display_ctx),
+                         "failed to create hip stream context");
 
-    ROCPROFILER_CALL(
-        rocprofiler_configure_callback_tracing_service(hip_stream_display_ctx,
-                                                       ROCPROFILER_CALLBACK_TRACING_HIP_STREAM,
-                                                       nullptr,
-                                                       0,
-                                                       callbacks.hip_stream,
-                                                       nullptr),
-        "hip stream tracing configure failed");
+        ROCPROFILER_CALL(
+            rocprofiler_configure_callback_tracing_service(hip_stream_display_ctx,
+                                                           ROCPROFILER_CALLBACK_TRACING_HIP_STREAM,
+                                                           nullptr,
+                                                           0,
+                                                           callbacks.hip_stream,
+                                                           nullptr),
+            "hip stream tracing configure failed");
 
-    start_context(hip_stream_display_ctx, "hip stream");
+        start_context(hip_stream_display_ctx, "hip stream");
+    }
 
     // Track if HIP runtime has been initialized via runtime_intialization service
     auto runtime_initialization_ctx = rocprofiler_context_id_t{0};
@@ -2922,20 +2965,26 @@ generate_output(cleanup_mode _cleanup_mode)
 
     auto _dtor = common::scope_destructor{run_cleanup};
 
-    generate_output(kernel_dispatch_output, outdata, contributions, cleanups);
-    generate_output(hsa_output, outdata, contributions, cleanups);
-    generate_output(hip_output, outdata, contributions, cleanups);
-    generate_output(memory_copy_output, outdata, contributions, cleanups);
-    generate_output(memory_allocation_output, outdata, contributions, cleanups);
-    generate_output(kfd_output, outdata, contributions, cleanups);
-    generate_output(marker_output, outdata, contributions, cleanups);
-    generate_output(rccl_output, outdata, contributions, cleanups);
-    generate_output(counters_output, outdata, contributions, cleanups);
-    generate_output(scratch_memory_output, outdata, contributions, cleanups);
-    generate_output(rocdecode_output, outdata, contributions, cleanups);
-    generate_output(pc_sampling_host_trap_output, outdata, contributions, cleanups);
-    generate_output(rocjpeg_output, outdata, contributions, cleanups);
-    generate_output(pc_sampling_stochastic_output, outdata, contributions, cleanups);
+    auto run_generate_output = [&](std::string_view label, auto& output) {
+        emit_finalize_trace(fmt::format("generate_output begin {}", label));
+        generate_output(output, outdata, contributions, cleanups);
+        emit_finalize_trace(fmt::format("generate_output end {}", label));
+    };
+
+    run_generate_output("kernel_dispatch", kernel_dispatch_output);
+    run_generate_output("hsa", hsa_output);
+    run_generate_output("hip", hip_output);
+    run_generate_output("memory_copy", memory_copy_output);
+    run_generate_output("memory_allocation", memory_allocation_output);
+    run_generate_output("kfd", kfd_output);
+    run_generate_output("marker", marker_output);
+    run_generate_output("rccl", rccl_output);
+    run_generate_output("counters", counters_output);
+    run_generate_output("scratch_memory", scratch_memory_output);
+    run_generate_output("rocdecode", rocdecode_output);
+    run_generate_output("pc_sampling_host_trap", pc_sampling_host_trap_output);
+    run_generate_output("rocjpeg", rocjpeg_output);
+    run_generate_output("pc_sampling_stochastic", pc_sampling_stochastic_output);
 
     if(tool::get_config().advanced_thread_trace && !tool_metadata->att_filenames.empty())
     {
@@ -2949,13 +2998,17 @@ generate_output(cleanup_mode _cleanup_mode)
     if(tool::get_config().csv_output && outdata.num_output > 0 &&
        outdata.num_bytes >= tool::get_config().minimum_output_bytes)
     {
+        emit_finalize_trace("generate_csv begin agents");
         tool::generate_csv(tool::get_config(), *tool_metadata, agents_output);
+        emit_finalize_trace("generate_csv end agents");
     }
 
     if(tool::get_config().stats && tool::get_config().csv_output && outdata.num_output > 0 &&
        outdata.num_bytes >= tool::get_config().minimum_output_bytes)
     {
+        emit_finalize_trace("generate_csv begin contributions");
         tool::generate_csv(tool::get_config(), *tool_metadata, contributions);
+        emit_finalize_trace("generate_csv end contributions");
     }
 
     if(tool::get_config().json_output && outdata.num_output > 0 &&
@@ -3129,11 +3182,32 @@ tool_fini(void* /*tool_data*/)
     if(tool_metadata->process_end_ns == 0)
         rocprofiler_get_timestamp(&(tool_metadata->process_end_ns));
 
+    std::fprintf(stderr, "[rocprofv3][finalize] tool_fini begin\n");
+    std::fflush(stderr);
+    emit_finalize_trace("tool_fini begin");
     flush();
+    std::fprintf(stderr, "[rocprofv3][finalize] tool_fini after first flush\n");
+    std::fflush(stderr);
+    emit_finalize_trace("tool_fini after first flush");
+    emit_finalize_trace("tool_fini stop_context begin");
+    std::fprintf(stderr, "[rocprofv3][finalize] tool_fini stop_context begin\n");
+    std::fflush(stderr);
     rocprofiler_stop_context(get_client_ctx());
+    std::fprintf(stderr, "[rocprofv3][finalize] tool_fini stop_context end\n");
+    std::fflush(stderr);
+    emit_finalize_trace("tool_fini stop_context end");
     flush();
+    std::fprintf(stderr, "[rocprofv3][finalize] tool_fini after second flush\n");
+    std::fflush(stderr);
+    emit_finalize_trace("tool_fini after second flush");
 
+    std::fprintf(stderr, "[rocprofv3][finalize] tool_fini generate_output begin\n");
+    std::fflush(stderr);
+    emit_finalize_trace("tool_fini generate_output begin");
     generate_output(cleanup_mode::destroy);
+    std::fprintf(stderr, "[rocprofv3][finalize] tool_fini generate_output end\n");
+    std::fflush(stderr);
+    emit_finalize_trace("tool_fini generate_output end");
 
     if(destructors)
     {
@@ -3150,6 +3224,10 @@ tool_fini(void* /*tool_data*/)
         ROCP_INFO << "removing attach arguments file: " << attach_args_fname;
         fs::remove(attach_args_fname);
     }
+
+    std::fprintf(stderr, "[rocprofv3][finalize] tool_fini end\n");
+    std::fflush(stderr);
+    emit_finalize_trace("tool_fini end");
 
 #if defined(CODECOV) && CODECOV > 0
     __gcov_dump();
