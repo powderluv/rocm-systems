@@ -45,6 +45,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -260,6 +261,7 @@ private:
     mutable std::vector<hsa_signal_t>    _retired_signals      = {};
     mutable std::mutex                   _async_signal_slots_mutex;
     mutable std::vector<std::unique_ptr<async_signal_slot>> _async_signal_slots = {};
+    mutable std::deque<async_signal_slot*> _ready_async_signal_slots = {};
     mutable std::mutex                   _async_signal_slot_builder_mutex;
     mutable std::condition_variable      _async_signal_slot_builder_cv = {};
     mutable std::thread                  _async_signal_slot_builder = {};
@@ -291,5 +293,24 @@ Queue::lock_queue(FuncT&& func)
     std::unique_lock<std::mutex> lock(_lock_queue);
     func();
 }
+
+struct async_signal_handler_data
+{
+    std::shared_ptr<Queue::queue_info_session_t> session = {};
+    Queue*                                       owner   = nullptr;
+    async_signal_slot*                           slot    = nullptr;
+    std::mutex                                   mutex   = {};
+    std::atomic<bool>                            handled = false;
+};
+
+struct async_signal_slot
+{
+    Queue*                                     owner        = nullptr;
+    hsa_signal_t                               signal       = {};
+    std::shared_ptr<async_signal_handler_data> handler_data = {};
+    std::mutex                                 mutex        = {};
+    std::atomic<bool>                          in_use       = false;
+    std::atomic<bool>                          ready        = false;
+};
 }  // namespace hsa
 }  // namespace rocprofiler

@@ -71,27 +71,6 @@ namespace rocprofiler
 {
 namespace hsa
 {
-struct async_signal_slot;
-
-struct async_signal_handler_data
-{
-    std::shared_ptr<Queue::queue_info_session_t> session = {};
-    Queue*                                       owner   = nullptr;
-    async_signal_slot*                           slot    = nullptr;
-    std::mutex                                   mutex   = {};
-    std::atomic<bool>                            handled = false;
-};
-
-struct async_signal_slot
-{
-    Queue*                                       owner        = nullptr;
-    hsa_signal_t                                 signal       = {};
-    std::shared_ptr<async_signal_handler_data>   handler_data = {};
-    std::mutex                                   mutex        = {};
-    std::atomic<bool>                            in_use       = false;
-    std::atomic<bool>                            ready        = false;
-};
-
 namespace
 {
 int
@@ -210,9 +189,7 @@ ProcessDispatchCompletion(std::shared_ptr<Queue::queue_info_session_t>& shared_p
     if(!shared_ptr_info) return;
 
     auto& queue_info_session = *shared_ptr_info;
-
     auto dispatch_time = kernel_dispatch::get_dispatch_time(queue_info_session);
-
     kernel_dispatch::dispatch_complete(queue_info_session, dispatch_time);
 
     // Calls our internal callbacks to callers who need to be notified post
@@ -878,6 +855,10 @@ Queue::emit_queue_signal_trace(const char* reason) const
 {
     if(!queue_signal_trace_enabled()) return;
 
+    const auto avg_us = [](uint64_t total_ns, uint64_t calls) {
+        return (calls > 0) ? static_cast<double>(total_ns) / (1000.0 * calls) : 0.0;
+    };
+
     auto total_slots     = uint64_t{0};
     auto ready_slots     = uint64_t{0};
     auto in_use_slots    = uint64_t{0};
@@ -929,20 +910,18 @@ Queue::emit_queue_signal_trace(const char* reason) const
         get_id().handle,
         reason,
         create_calls,
-        create_calls > 0 ? static_cast<double>(create_total_ns) / (1000.0 * create_calls) : 0.0,
+        avg_us(create_total_ns, create_calls),
         static_cast<double>(
             _queue_signal_trace.create_signal_max_ns.load(std::memory_order_relaxed)) /
             1000.0,
         _queue_signal_trace.direct_create_signal_calls.load(std::memory_order_relaxed),
         register_calls,
-        register_calls > 0 ? static_cast<double>(register_total_ns) / (1000.0 * register_calls)
-                           : 0.0,
+        avg_us(register_total_ns, register_calls),
         static_cast<double>(
             _queue_signal_trace.async_register_max_ns.load(std::memory_order_relaxed)) /
             1000.0,
         prepare_calls,
-        prepare_calls > 0 ? static_cast<double>(prepare_total_ns) / (1000.0 * prepare_calls)
-                          : 0.0,
+        avg_us(prepare_total_ns, prepare_calls),
         static_cast<double>(
             _queue_signal_trace.slot_prepare_max_ns.load(std::memory_order_relaxed)) /
             1000.0,
@@ -1029,34 +1008,31 @@ Queue::acquire_async_signal_slot() const
     std::lock_guard<std::mutex> lk{_async_signal_slots_mutex};
     const auto attempts =
         _queue_signal_trace.slot_acquire_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto total_slots     = uint64_t{0};
-    auto ready_slots     = uint64_t{0};
-    auto in_use_slots    = uint64_t{0};
+    auto total_slots  = static_cast<uint64_t>(_async_signal_slots.size());
+    auto ready_slots  = static_cast<uint64_t>(_ready_async_signal_slots.size());
+    auto in_use_slots = uint64_t{0};
     auto tombstone_slots = uint64_t{0};
 
-    for(auto& slot : _async_signal_slots)
+    while(!_ready_async_signal_slots.empty())
     {
+        auto* slot = _ready_async_signal_slots.front();
+        _ready_async_signal_slots.pop_front();
         if(!slot) continue;
-        ++total_slots;
-        const auto ready = slot->ready.load(std::memory_order_acquire);
-        const auto in_use = slot->in_use.load(std::memory_order_acquire);
-        if(ready) ++ready_slots;
-        if(in_use) ++in_use_slots;
-        if(slot->signal.handle == 0u && !ready && !in_use) ++tombstone_slots;
 
         bool expected = false;
-        if(ready && slot->in_use.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        if(slot->ready.load(std::memory_order_acquire) &&
+           slot->in_use.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         {
             slot->ready.store(false, std::memory_order_release);
+            ready_slots = static_cast<uint64_t>(_ready_async_signal_slots.size());
             update_queue_signal_pool_state(total_slots, ready_slots, in_use_slots, tombstone_slots);
             const auto hits =
                 _queue_signal_trace.slot_acquire_hits.fetch_add(1, std::memory_order_relaxed) + 1;
             notify_async_signal_slot_builder();
             maybe_emit_queue_signal_trace("slot-acquire-hit", hits);
-            return slot.get();
+            return slot;
         }
     }
-
     update_queue_signal_pool_state(total_slots, ready_slots, in_use_slots, tombstone_slots);
     const auto misses =
         _queue_signal_trace.slot_acquire_misses.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1105,22 +1081,14 @@ Queue::fill_async_signal_slots(uint64_t target_slots) const
 {
     while(!_async_signal_slot_builder_shutdown.load(std::memory_order_acquire))
     {
-        auto ready_slots     = 0;
-        auto in_use_slots    = 0;
-        auto tombstone_slots = 0;
-        auto total_slots     = 0;
+        auto ready_slots     = uint64_t{0};
+        auto in_use_slots    = uint64_t{0};
+        auto tombstone_slots = uint64_t{0};
+        auto total_slots     = uint64_t{0};
         {
             std::lock_guard<std::mutex> lk{_async_signal_slots_mutex};
-            for(const auto& slot : _async_signal_slots)
-            {
-                if(!slot) continue;
-                const auto ready  = slot->ready.load(std::memory_order_acquire);
-                const auto in_use = slot->in_use.load(std::memory_order_acquire);
-                if(ready) ++ready_slots;
-                if(in_use) ++in_use_slots;
-                if(slot->signal.handle == 0u && !ready && !in_use) ++tombstone_slots;
-                ++total_slots;
-            }
+            ready_slots = static_cast<uint64_t>(_ready_async_signal_slots.size());
+            total_slots = static_cast<uint64_t>(_async_signal_slots.size());
         }
         update_queue_signal_pool_state(total_slots, ready_slots, in_use_slots, tombstone_slots);
 
@@ -1141,6 +1109,7 @@ Queue::fill_async_signal_slots(uint64_t target_slots) const
             {
                 std::lock_guard<std::mutex> lk{_async_signal_slots_mutex};
                 _async_signal_slots.emplace_back(std::move(slot));
+                _ready_async_signal_slots.emplace_back(slot_ptr);
             }
             _queue_signal_trace.slot_builder_created.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1261,13 +1230,16 @@ Queue::drain_retired_signals() const
         pending.swap(_retired_signals);
     }
 
-    _queue_signal_trace.retired_signal_drained.fetch_add(pending.size(), std::memory_order_relaxed);
+    const auto drained =
+        _queue_signal_trace.retired_signal_drained.fetch_add(pending.size(),
+                                                             std::memory_order_relaxed) +
+        pending.size();
     for(const auto& signal : pending)
     {
         _core_api.hsa_signal_destroy_fn(signal);
     }
 
-    if(!pending.empty()) emit_queue_signal_trace("retired-drain");
+    if(!pending.empty()) maybe_emit_queue_signal_trace("retired-drain", drained);
 }
 
 void
@@ -1276,6 +1248,7 @@ Queue::destroy_async_signal_slots() const
     auto pending = std::vector<std::unique_ptr<async_signal_slot>>{};
     {
         std::lock_guard<std::mutex> lk{_async_signal_slots_mutex};
+        _ready_async_signal_slots.clear();
         pending.swap(_async_signal_slots);
     }
 
