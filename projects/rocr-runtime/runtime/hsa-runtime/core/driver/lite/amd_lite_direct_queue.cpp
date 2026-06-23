@@ -605,8 +605,37 @@ hsa_status_t ProgramMesQueueRegisters(const DirectQueuePlatform& platform,
 
   uint32_t vmid = 0;
   uint32_t doorbell_ctl = 0;
+  // Windows doorbell-dead workaround (ROCR_WINDOWS_MES_WPTR_POLL):
+  // On the Windows WDDM/passthrough setup, host doorbell writes do NOT
+  // reach the GPU (proven by dbprobe), so the MES KIQ -- which relies
+  // solely on the doorbell -- never services SET_HW_RESOURCES. The WORKING
+  // direct compute queue advances via WPTR_POLL: CreateDirectQueue never
+  // touches CP_PQ_WPTR_POLL_CNTL, so it keeps the firmware/RLC default
+  // (dbprobe read back 0x1 = enabled). When the env flag is set we mirror
+  // that here for the KIQ HQD: write the enabled value instead of 0 so the
+  // MES pipe's CP polls the KIQ ring's in-memory wptr
+  // (CP_HQD_PQ_WPTR_POLL_ADDR/_HI = mqd[0x8D/0x8E] = layout.wptr_gpu, set
+  // below) without a doorbell event. Default (flag unset) = 0 = unchanged,
+  // so macOS/Linux behavior is identical.
+  uint32_t mes_wptr_poll_cntl = 0;
+  {
+    const char* poll_env = std::getenv("ROCR_WINDOWS_MES_WPTR_POLL");
+    if (poll_env != nullptr && poll_env[0] != '\0' &&
+        std::strcmp(poll_env, "0") != 0) {
+      // 0x1 = the enabled value the working direct queue runs with (the
+      // firmware default CreateDirectQueue leaves untouched; dbprobe saw 0x1).
+      mes_wptr_poll_cntl = 0x1u;
+      if (options.trace) {
+        std::fprintf(stderr,
+                     "%s %s WPTR_POLL workaround enabled: "
+                     "CP_PQ_WPTR_POLL_CNTL=0x%x\n",
+                     TracePrefix(options), label ? label : "MES KIQ",
+                     mes_wptr_poll_cntl);
+      }
+    }
+  }
   if (!write(kGcBase0, regCP_HQD_ACTIVE, 0) ||
-      !write(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, 0) ||
+      !write(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, mes_wptr_poll_cntl) ||
       !write(kGcBase0, regCP_HQD_PQ_RPTR, 0) ||
       !write(kGcBase0, regCP_HQD_PQ_WPTR_LO, 0) ||
       !write(kGcBase0, regCP_HQD_PQ_WPTR_HI, 0) ||
@@ -898,6 +927,7 @@ void DumpMesRingState(const DirectQueuePlatform& platform,
   uint32_t rptr_report_hi = 0;
   uint32_t wptr_poll = 0;
   uint32_t wptr_poll_hi = 0;
+  uint32_t wptr_poll_cntl = 0;
   uint32_t doorbell_control = 0;
   uint32_t persistent = 0;
   uint32_t dequeue_status = 0;
@@ -920,6 +950,8 @@ void DumpMesRingState(const DirectQueuePlatform& platform,
   platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_WPTR_POLL_ADDR, &wptr_poll);
   platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_WPTR_POLL_ADDR_HI,
                       &wptr_poll_hi);
+  // WPTR_POLL workaround signal: is the KIQ pipe's CP polling enabled?
+  platform.ReadMmio32(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, &wptr_poll_cntl);
   platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_DOORBELL_CONTROL,
                       &doorbell_control);
   platform.ReadMmio32(kGcBase0, regCP_HQD_PERSISTENT_STATE, &persistent);
@@ -943,11 +975,13 @@ void DumpMesRingState(const DirectQueuePlatform& platform,
                "%s MES %s regs mqd=0x%08x:%08x pq=0x%08x:%08x "
                "pq_ctl=0x%08x rptr=0x%x wptr=0x%08x:%08x "
                "rptr_report=0x%08x:%08x wptr_poll=0x%08x:%08x "
+               "wptr_poll_cntl=0x%08x "
                "doorbell_ctl=0x%08x persistent=0x%08x dequeue=0x%08x\n",
                TracePrefix(options), phase ? phase : "diagnostic",
                mqd_base_hi, mqd_base, pq_base_hi, pq_base, pq_control, rptr,
                wptr_hi, wptr, rptr_report_hi, rptr_report, wptr_poll_hi,
-               wptr_poll, doorbell_control, persistent, dequeue_status);
+               wptr_poll, wptr_poll_cntl, doorbell_control, persistent,
+               dequeue_status);
 
   if (ring.ring_cpu != nullptr) {
     std::fprintf(stderr, "%s MES %s ring[0..15]=", TracePrefix(options),
@@ -1014,11 +1048,77 @@ hsa_status_t SubmitMesApiFrameOnRing(
                  frame[50], query[0]);
     DumpMesRingState(platform, ring, options, "pre-doorbell");
   }
+  // Windows doorbell-dead workaround (ROCR_WINDOWS_MES_MMIO_WPTR):
+  // Host doorbell writes do NOT reach the GPU on this WDDM/passthrough setup
+  // (proven by dbprobe: doorbell-only FAILS), and WPTR_POLL on the KIQ does
+  // NOT make the MES service the ring either (KIQ RPTR stayed 0). The only
+  // mechanism proven to advance an HQD on this setup is the direct MMIO wptr
+  // poke that SubmitDirectQueue uses for the MEC (me=1): after writing the
+  // ring + the in-mem wptr, it does SelectHqd(me,pipe,hqd) and writes
+  // CP_HQD_PQ_WPTR_LO/HI, and the MEC's CP fetches the ring. Mirror that
+  // exactly for the KIQ HQD here (me=3/pipe=1/queue=0, the same select the
+  // MES path already uses in ProgramMesQueueRegisters/DumpMesRingState) so
+  // the MES pipe's CP picks up the wptr and fetches the KIQ ring without a
+  // doorbell event. Default (flag unset) = unchanged, so macOS/Linux behave
+  // identically. Independent of ROCR_WINDOWS_MES_WPTR_POLL (both can be set).
+  const char* mmio_wptr_env = std::getenv("ROCR_WINDOWS_MES_MMIO_WPTR");
+  const bool mmio_wptr_poke =
+      mmio_wptr_env != nullptr && mmio_wptr_env[0] != '\0' &&
+      std::strcmp(mmio_wptr_env, "0") != 0;
+  if (mmio_wptr_poke) {
+    const uint32_t pipe = MesPipeForRing(ring);
+    status = SelectHqd(platform, kMesKiqMe, pipe, kMesKiqHqd);
+    if (status == HSA_STATUS_SUCCESS) {
+      // Same registers SubmitDirectQueue's MEC poke writes.
+      status = platform.WriteMmio32(kGcBase0, regCP_HQD_PQ_WPTR_LO,
+                                    static_cast<uint32_t>(new_wptr));
+      if (status == HSA_STATUS_SUCCESS) {
+        status = platform.WriteMmio32(kGcBase0, regCP_HQD_PQ_WPTR_HI,
+                                      static_cast<uint32_t>(new_wptr >> 32));
+      }
+    }
+    if (options.trace) {
+      // Diagnostics: did the poke latch (CP_HQD_PQ_WPTR) and does the KIQ
+      // RPTR advance now? RPTR advancing + api_fence reaching expected = win.
+      uint32_t poke_active = 0;
+      uint32_t poke_rptr = 0;
+      uint32_t poke_wptr = 0;
+      uint32_t poke_wptr_hi = 0;
+      platform.ReadMmio32(kGcBase0, regCP_HQD_ACTIVE, &poke_active);
+      platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_RPTR, &poke_rptr);
+      platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_WPTR_LO, &poke_wptr);
+      platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_WPTR_HI, &poke_wptr_hi);
+      std::fprintf(stderr,
+                   "%s MES API %s mmio-wptr poke me=%u pipe=%u hqd=%u "
+                   "new_wptr=%llu active=0x%x rptr=0x%x wptr=0x%08x:%08x "
+                   "status=%u\n",
+                   TracePrefix(options), opcode_name ? opcode_name : "unknown",
+                   kMesKiqMe, pipe, kMesKiqHqd,
+                   static_cast<unsigned long long>(new_wptr), poke_active,
+                   poke_rptr, poke_wptr_hi, poke_wptr, status);
+    }
+    DeselectHqd(platform);
+    if (status != HSA_STATUS_SUCCESS) return status;
+  }
   *ring.doorbell_cpu = new_wptr;
   ring.wptr = new_wptr;
   if (options.trace_verbose) {
     platform.SleepUs(100);
     DumpMesRingState(platform, ring, options, "post-doorbell");
+    // WPTR_POLL workaround win-signal: pair the KIQ RPTR (printed by
+    // DumpMesRingState above) with the api_fence here. If the KIQ RPTR
+    // advanced and api_fence reaches the expected value WITHOUT the doorbell
+    // delivering, the MES serviced the frame purely via the in-memory
+    // wptr-poll => the Windows doorbell-dead workaround works.
+    std::fprintf(stderr,
+                 "%s MES API %s post-doorbell api_fence[0]=0x%llx "
+                 "api_fence[1]=0x%llx expected=%llu wptr_dword=%llu\n",
+                 TracePrefix(options), opcode_name ? opcode_name : "unknown",
+                 static_cast<unsigned long long>(api_fence_cpu[0]),
+                 static_cast<unsigned long long>(api_fence_cpu[1]),
+                 static_cast<unsigned long long>(fence_value),
+                 static_cast<unsigned long long>(
+                     ring.wptr_cpu != nullptr ? *ring.wptr_cpu : 0));
   }
 
   constexpr uint32_t kStepUs = 1000;
@@ -2278,6 +2378,56 @@ hsa_status_t SubmitDirectQueue(const DirectQueuePlatform& platform,
   }
 
   if (queue.mes_backed) {
+    // Windows doorbell-dead workaround (ROCR_WINDOWS_MES_MMIO_WPTR): the MES
+    // mapped this compute queue onto a hardware MEC HQD slot via ADD_QUEUE/
+    // MAP_LEGACY, which uses frame[50]/frame[51] = DirectQueuePipe/Hqd(
+    // queue_index) on the MEC engine (me=1) -- the SAME slot a DIRECT queue of
+    // the same queue_index occupies. The doorbell (0x20) is dead on this WDDM/
+    // passthrough setup, so ringing it alone never makes the CP fetch the NOP.
+    // The only mechanism proven to advance an HQD here is the direct MMIO wptr
+    // poke (SubmitDirectQueue's me=1 path) and the scheduler-ring poke
+    // (SubmitMesApiFrameOnRing's me=3 KIQ path). Mirror it for the mapped
+    // compute HQD: SelectHqd(me=1, pipe, hqd) -> write CP_HQD_PQ_WPTR_LO/HI =
+    // new_wptr so the MEC's CP picks up the wptr and fetches the ring without a
+    // doorbell event. pipe/hqd_queue above are exactly DirectQueuePipe/Hqd(
+    // queue_index), i.e. the slot the MES mapped. Default (flag unset) keeps the
+    // doorbell-only behavior so macOS/Linux are unchanged.
+    const char* mes_mmio_wptr_env = std::getenv("ROCR_WINDOWS_MES_MMIO_WPTR");
+    const bool mes_mmio_wptr_poke =
+        mes_mmio_wptr_env != nullptr && mes_mmio_wptr_env[0] != '\0' &&
+        std::strcmp(mes_mmio_wptr_env, "0") != 0;
+    if (mes_mmio_wptr_poke) {
+      status = SelectHqd(platform, 1, pipe, hqd_queue);
+      if (status == HSA_STATUS_SUCCESS) {
+        status = platform.WriteMmio32(kGcBase0, regCP_HQD_PQ_WPTR_LO,
+                                      static_cast<uint32_t>(new_wptr));
+        if (status == HSA_STATUS_SUCCESS) {
+          status = platform.WriteMmio32(kGcBase0, regCP_HQD_PQ_WPTR_HI,
+                                        static_cast<uint32_t>(new_wptr >> 32));
+        }
+      }
+      if (options.trace) {
+        // Diagnostics: did the poke latch the compute HQD wptr, and does its
+        // RPTR advance? RPTR advancing + compute NOP fence reaching 1 = win.
+        uint32_t poke_active = 0;
+        uint32_t poke_rptr = 0;
+        uint32_t poke_wptr = 0;
+        uint32_t poke_wptr_hi = 0;
+        platform.ReadMmio32(kGcBase0, regCP_HQD_ACTIVE, &poke_active);
+        platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_RPTR, &poke_rptr);
+        platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_WPTR_LO, &poke_wptr);
+        platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_WPTR_HI, &poke_wptr_hi);
+        std::fprintf(stderr,
+                     "%s MES-backed mmio-wptr poke me=1 pipe=%u hqd=%u "
+                     "new_wptr=%llu active=0x%x rptr=0x%x wptr=0x%08x:%08x "
+                     "status=%u\n",
+                     TracePrefix(options), pipe, hqd_queue,
+                     static_cast<unsigned long long>(new_wptr), poke_active,
+                     poke_rptr, poke_wptr_hi, poke_wptr, status);
+      }
+      DeselectHqd(platform);
+      if (status != HSA_STATUS_SUCCESS) return status;
+    }
     *queue.doorbell_cpu = new_wptr;
     queue.wptr = new_wptr;
     if (options.trace) {
