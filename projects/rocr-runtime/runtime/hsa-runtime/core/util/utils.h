@@ -425,7 +425,7 @@ inline void FlushCpuCache(const void* base, size_t offset, size_t len) {
   cur += offset;
   uintptr_t lastline = (uintptr_t)(cur + len - 1) | (cacheline_size - 1);
   do {
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
     _mm_clflush((const void*)cur);
 #elif defined(__aarch64__) || defined(__arm64__)
     // Data cache clean and invalidate by virtual address to Point of

@@ -94,7 +94,7 @@ namespace {
 
 const std::array<std::function<hsa_status_t(std::unique_ptr<core::Driver>&)>,
 #if _WIN32
-                 1
+                 2
 #elif __linux__
                  static_cast<size_t>(core::DriverType::NUM_DRIVER_TYPES)
 #elif __APPLE__
@@ -105,6 +105,7 @@ const std::array<std::function<hsa_status_t(std::unique_ptr<core::Driver>&)>,
     discover_driver_funcs = {
 #if _WIN32
         KfdDriver::DiscoverDriver
+        , WindowsLiteDriver::DiscoverDriver
 #elif __linux__
         KfdDriver::DiscoverDriver
         , XdnaDriver::DiscoverDriver

@@ -85,6 +85,30 @@ if (ROCM_CCACHE_BUILD)
   endif() # if (CCACHE_PROGRAM)
 endif() # if (ROCM_CCACHE_BUILD)
 
+# WIN32-OCLELF-SCAFFOLD: build in-tree oclelf as the libelf provider on Windows,
+# and alias it as elf::elf so the find_package(LibElf) block below is skipped.
+if(WIN32 AND DEFINED AMD_LIBELF_PATH AND NOT TARGET oclelf)
+  add_subdirectory(${AMD_LIBELF_PATH} ${CMAKE_BINARY_DIR}/oclelf_build)
+  # libelf.h pulls <sys/queue.h>/<elfdefinitions.h>; propagate the libelf + win32
+  # compat dirs so ROCr TUs that include libelf.h compile (oclelf keeps them PRIVATE).
+  target_include_directories(oclelf INTERFACE
+    ${AMD_LIBELF_PATH} ${AMD_LIBELF_PATH}/../common ${AMD_LIBELF_PATH}/../common/win32)
+endif()
+if(WIN32 AND TARGET oclelf AND NOT TARGET elf::elf)
+  add_library(elf::elf ALIAS oclelf)
+endif()
+
+# WIN32-HSAKMT-SCAFFOLD: the superbuild normally provides hsakmt::hsakmt via
+# add_subdirectory; in the standalone Windows build libhsakmt is built/installed
+# separately, so import the prebuilt static lib as that target.
+if(WIN32 AND DEFINED HSAKMT_LIB AND NOT TARGET hsakmt::hsakmt)
+  add_library(hsakmt::hsakmt STATIC IMPORTED)
+  set_target_properties(hsakmt::hsakmt PROPERTIES
+    IMPORTED_LOCATION "${HSAKMT_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${HSAKMT_INC};${HSAKMT_INC}/hsakmt"
+    INTERFACE_LINK_LIBRARIES "${WKMI_LIB}")
+endif()
+
 ## Find external dependencies.
 find_package(PkgConfig)
 
@@ -266,6 +290,22 @@ else()
                 core/driver/lite/linux/amd_lite_linux_transport.cpp
                 core/runtime/amd_lite_aql_queue.cpp
                 core/runtime/amd_lite_agent.cpp)
+  elseif (WIN32)
+    # Windows lite:: backend over the amdgpu_mcdm WDDM KMD (D3DKMTEscape).
+    # WDDM_LITE_DIR must point to the wddm_lite source tree (wddm_lite.h,
+    # wddm_lite.cpp, gpu_init.cpp).  The standalone test harness
+    # (lite_direct_queue_test.cpp / wddm_lite_test.cpp) is NOT added here.
+    set(WDDM_LITE_DIR "" CACHE PATH "Path to wddm_lite (wddm_lite.h/wddm_lite.cpp/gpu_init.cpp)")
+    if(NOT WDDM_LITE_DIR)
+      message(FATAL_ERROR "WIN32 ROCr build requires -DWDDM_LITE_DIR=<path to wddm_lite dir>")
+    endif()
+    list(APPEND SRCS
+                core/driver/lite/windows/amd_windows_lite_driver.cpp
+                ${WDDM_LITE_DIR}/wddm_lite.cpp
+                ${WDDM_LITE_DIR}/gpu_init.cpp
+                # PcsRuntime is referenced unconditionally by amd_gpu_agent/
+                # amd_aql_queue/runtime; compile it even with PC sampling off.
+                pcs/pcs_runtime.cpp)
   endif()
 endif()
 list(APPEND SRCS
@@ -335,8 +375,14 @@ endif()
 
 target_sources( ${CORE_RUNTIME_TARGET} PRIVATE ${SRCS} ${SRC_OS} ${SRC_XDNA} )
 
+## WIN32: amd_windows_lite_driver.cpp does #include "wddm_lite.h" so WDDM_LITE_DIR
+## must be on the include path. Only set when WDDM_LITE_DIR was required above.
+if (WIN32 AND WDDM_LITE_DIR)
+  target_include_directories(${CORE_RUNTIME_TARGET} PRIVATE ${WDDM_LITE_DIR})
+endif()
+
 ## Depend on trap handler target.
-if (APPLE)
+if (APPLE OR WIN32)
   # Darwin has no installed amdgpu-targeting clang / llvm-objcopy, so the
   # trap-handler and blit-shader GPU asm builds can't run. Emit stub header
   # files with empty byte arrays so amd_gpu_agent.cpp compiles; when a
@@ -365,7 +411,7 @@ else()
 endif()
 
 ## Depend on blit shader target.
-if (APPLE)
+if (APPLE OR WIN32)
   # Same rationale as trap_handler — stub out the generated blit_shaders
   # header. Consumer: core/runtime/amd_blit_kernel.cpp references the
   # kCodeBlitKernel* arrays. Emit zero-length arrays; the MacOsDriver path
@@ -502,6 +548,9 @@ else()
   target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE Ws2_32 )
   target_link_directories(${CORE_RUNTIME_TARGET} PRIVATE ${DXCORE_LIB_PATH})
   target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE dxcore)
+  # D3DKMT (D3DKMTOpenAdapterFromDeviceName / D3DKMTEscape) for the
+  # amdgpu_mcdm WDDM lite:: backend lives in gdi32.
+  target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE gdi32)
 endif()
 
 # For static package rocprofiler-register dependency is not required

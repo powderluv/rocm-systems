@@ -58,7 +58,13 @@
 #include "loader/executable.hpp"
 #endif
 
+#ifndef _WIN32
+// r_debug is from <link.h> (Linux) or link_darwin.h (macOS).
+// On WIN32 it is defined in loader/executable.hpp (included above) and the
+// symbol itself lives in loader/executable.cpp -- the extern is redundant here
+// and would shadow the definition; suppress it on WIN32.
 extern r_debug _amdgpu_r_debug;
+#endif
 
 namespace rocr {
 
@@ -110,6 +116,11 @@ KfdDriver::KfdDriver(std::string devnode_name)
     : core::Driver(core::DriverType::KFD, std::move(devnode_name)) {}
 
 hsa_status_t KfdDriver::Init() {
+#ifdef _WIN32
+  // KFD (/dev/kfd) is a Linux-only backend; on Windows WindowsLiteDriver is
+  // the active driver and KfdDriver is only a no-device discovery stub.
+  return HSA_STATUS_ERROR;
+#else
   HSAKMT_STATUS ret =
       HSAKMT_CALL(hsaKmtRuntimeEnable(&_amdgpu_r_debug, core::Runtime::runtime_singleton_->flag().debug()));
 
@@ -137,6 +148,7 @@ hsa_status_t KfdDriver::Init() {
   core::Runtime::runtime_singleton_->XnackEnabled(xnack_mode);
 
   return HSA_STATUS_SUCCESS;
+#endif
 }
 
 hsa_status_t KfdDriver::ShutDown() {

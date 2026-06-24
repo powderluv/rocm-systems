@@ -72,7 +72,7 @@ class HybridMutex {
     while (!lock_.compare_exchange_strong(old, 1)) {
       cnt--;
       if (cnt > maxSpinIterPause) {
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
         _mm_pause();
 #elif defined(__aarch64__) || defined(__arm64__)
         // ARMv8 YIELD hint — same role as x86 PAUSE in spin-wait loops.
