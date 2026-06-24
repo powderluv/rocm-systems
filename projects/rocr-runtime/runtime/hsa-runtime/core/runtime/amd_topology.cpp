@@ -45,6 +45,9 @@
 #if defined(__APPLE__)
 #include "core/inc/amd_macos_agent.h"
 #endif
+#if defined(_WIN32)
+#include "core/inc/amd_windows_agent.h"
+#endif
 #if defined(__linux__)
 #include "core/inc/amd_lite_agent.h"
 #endif
@@ -213,6 +216,16 @@ GpuAgent* DiscoverGpu(HSAuint32 node_id, HsaNodeProperties& node_prop, bool xnac
     if (enabled) mg->Enable();
     core::Runtime::runtime_singleton_->RegisterAgent(mg, enabled);
     return reinterpret_cast<GpuAgent*>(mg);
+  }
+#endif
+#if defined(_WIN32)
+  if (driver_type == core::DriverType::WINDOWS_WDDM_LITE) {
+    // WindowsGpuAgent is a GpuAgentInt subclass (like MacGpuAgent), not an
+    // AMD::GpuAgent; return it as GpuAgent* for ABI compat.
+    auto* wg = new WindowsGpuAgent(node_id, driver_type);
+    if (enabled) wg->Enable();
+    core::Runtime::runtime_singleton_->RegisterAgent(wg, enabled);
+    return reinterpret_cast<GpuAgent*>(wg);
   }
 #endif
 #if defined(__linux__)

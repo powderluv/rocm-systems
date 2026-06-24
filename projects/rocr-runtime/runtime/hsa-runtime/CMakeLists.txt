@@ -301,6 +301,8 @@ else()
     endif()
     list(APPEND SRCS
                 core/driver/lite/windows/amd_windows_lite_driver.cpp
+                core/runtime/amd_windows_agent.cpp
+                core/runtime/amd_windows_aql_queue.cpp
                 ${WDDM_LITE_DIR}/wddm_lite.cpp
                 ${WDDM_LITE_DIR}/gpu_init.cpp
                 # PcsRuntime is referenced unconditionally by amd_gpu_agent/

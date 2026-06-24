@@ -163,6 +163,13 @@ hsa_status_t KfdDriver::ShutDown() {
 }
 
 hsa_status_t KfdDriver::DiscoverDriver(std::unique_ptr<core::Driver>& driver) {
+#ifdef _WIN32
+  // KFD is Linux-only; on Windows the DXG thunk's hsaKmtOpenKFD() succeeds and
+  // would register a no-device KfdDriver whose Init() fails the whole topology.
+  // The WindowsLiteDriver is the Windows lite:: backend.
+  (void)driver;
+  return HSA_STATUS_ERROR;
+#else
   auto tmp_driver = std::unique_ptr<core::Driver>(new KfdDriver("/dev/kfd"));
 
   if (tmp_driver->Open() == HSA_STATUS_SUCCESS) {
@@ -171,6 +178,7 @@ hsa_status_t KfdDriver::DiscoverDriver(std::unique_ptr<core::Driver>& driver) {
   }
 
   return HSA_STATUS_ERROR;
+#endif
 }
 
 hsa_status_t KfdDriver::QueryKernelModeDriver(core::DriverQuery query) {

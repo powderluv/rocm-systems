@@ -559,6 +559,9 @@ class Runtime {
 #if defined(__APPLE__)
         || driver_type == core::DriverType::MACOS_DEXT
 #endif
+#if defined(_WIN32)
+        || driver_type == core::DriverType::WINDOWS_WDDM_LITE
+#endif
         ;
   }
 

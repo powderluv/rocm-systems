@@ -205,6 +205,10 @@ class WindowsLiteDriver final : public core::Driver,
   // Translate a CPU pointer inside a registered allocation to the GPU address
   // the CP fetches from. DMA (IOVA) tier first, then the VRAM-BAR window.
   hsa_status_t HostToGpuAddress(const void* ptr, uint64_t* gpu_addr) const;
+  // True if ptr falls inside a registered DMA allocation or the VRAM-BAR
+  // window (i.e. a device pointer that HostToGpuAddress can translate).
+  // Used by the AQL queue to decide kernarg-pointer translation.
+  bool IsRegisteredVramPointer(const void* ptr) const;
 
   hsa_status_t CreateDirectComputeQueue(DirectComputeQueue* queue);
   hsa_status_t DestroyDirectComputeQueue(DirectComputeQueue& queue);
@@ -273,6 +277,9 @@ class WindowsLiteDriver final : public core::Driver,
   uint32_t adapter_ = 0;
   uint32_t device_ = 0;
   DeviceInfo info_{};
+  // True when discovered via the wddm_lite probe (no amdgpu_mcdm escape
+  // adapter); the lite:: dispatch path opens its own WddmLite instance.
+  bool lite_discovered_ = false;
   mutable std::mutex gpu_lock_;
   // MAP_BAR'd apertures (cached once in EnsureBarMappingsLocked).
   void* mmio_bar_cpu_ = nullptr;

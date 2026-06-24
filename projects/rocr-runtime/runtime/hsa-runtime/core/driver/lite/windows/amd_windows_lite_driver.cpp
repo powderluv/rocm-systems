@@ -397,7 +397,7 @@ hsa_status_t WindowsLiteDriver::QueryKernelModeDriver(core::DriverQuery query) {
   if (query != core::DriverQuery::GET_DRIVER_VERSION) {
     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   }
-  if (adapter_ == 0) return HSA_STATUS_ERROR;
+  if (adapter_ == 0 && !lite_discovered_) return HSA_STATUS_ERROR;
   // AMDGPU_ESCAPE_GET_INFO carries no version field yet — seed a plausible
   // value from the successful Open() handshake, mirroring the macOS backend.
   // Real versioning lands when the KMD grows a GET_DRIVER_VERSION escape.
@@ -473,7 +473,23 @@ hsa_status_t WindowsLiteDriver::Open() {
     api.CloseAdapter(&close_args);
   }
 
-  // No amdgpu_mcdm adapter present.
+  // No amdgpu_mcdm escape adapter found. Fall back to the proven wddm_lite
+  // adapter (the lite:: dispatch path uses it anyway) so the driver is still
+  // discoverable. Probe a transient WddmLite for the AMD vendor id, then close
+  // it -- EnsureGpuBringUpLocked opens its own instance for dispatch.
+  {
+    WddmLite probe;
+    if (probe.open()) {
+      AMDGPU_ESCAPE_GET_INFO_DATA li{};
+      if (probe.getInfo(&li) && li.VendorId == 0x1002) {
+        info_.vendor_id = li.VendorId;
+        lite_discovered_ = true;
+        probe.close();
+        return HSA_STATUS_SUCCESS;
+      }
+      probe.close();
+    }
+  }
   return HSA_STATUS_ERROR;
 }
 
@@ -526,7 +542,7 @@ hsa_status_t WindowsLiteDriver::Close() {
 }
 
 hsa_status_t WindowsLiteDriver::GetSystemProperties(HsaSystemProperties& sys_props) const {
-  sys_props.NumNodes = (adapter_ != 0) ? 1 : 0;
+  sys_props.NumNodes = (adapter_ != 0 || lite_discovered_) ? 1 : 0;
   return HSA_STATUS_SUCCESS;
 }
 
@@ -772,6 +788,21 @@ hsa_status_t WindowsLiteDriver::HostToGpuAddress(const void* ptr, uint64_t* gpu_
   if (dp < base || dp >= base + vram_bar_size_) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
   *gpu_addr = framebuffer_base_ + (dp - base);
   return HSA_STATUS_SUCCESS;
+}
+
+bool WindowsLiteDriver::IsRegisteredVramPointer(const void* ptr) const {
+  if (ptr == nullptr) return false;
+  std::lock_guard<std::mutex> g(gpu_lock_);
+  const auto p = reinterpret_cast<uintptr_t>(ptr);
+  for (const auto& kv : dma_allocations_) {
+    const auto base = reinterpret_cast<uintptr_t>(kv.first);
+    if (p >= base && p < base + kv.second.size) return true;
+  }
+  if (vram_bar_cpu_ != nullptr) {
+    const auto base = reinterpret_cast<uintptr_t>(vram_bar_cpu_);
+    if (p >= base && p < base + vram_bar_size_) return true;
+  }
+  return false;
 }
 
 // ---- lite::DirectQueuePlatform overrides ------------------------------------
