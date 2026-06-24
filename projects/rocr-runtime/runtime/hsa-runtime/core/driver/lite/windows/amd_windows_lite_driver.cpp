@@ -63,6 +63,7 @@
 #include <d3dkmthk.h>
 // clang-format on
 
+#include <atomic>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -1017,6 +1018,111 @@ hsa_status_t WindowsLiteDriver::SetQueueScratch(DirectComputeQueue& queue,
   std::lock_guard<std::mutex> g(gpu_lock_);
   return lite::SetDirectQueueScratch(*this, queue, scratch_base_256, tmpring_size,
                                      WindowsDirectQueueOptions());
+}
+
+// Bring-up validation (Windows only; not part of the HSA API): dispatch a real
+// compiled kernel through THIS WindowsLiteDriver object. Mirrors the standalone
+// meskern probe but routes creation + submit through the driver's own
+// CreateDirectComputeQueue / SubmitDirectCompute (the shared lite:: path over
+// this driver's WddmLite instance), and stages the kernel GPUVM against that
+// same instance.
+hsa_status_t WindowsLiteDriver::DispatchKernelSelfTest() {
+  // 1. Bring up the GPU + create a direct compute queue through this driver.
+  DirectComputeQueue queue{};
+  hsa_status_t status = CreateDirectComputeQueue(&queue);
+  if (status != HSA_STATUS_SUCCESS) {
+    std::fprintf(stderr,
+                 "DispatchKernelSelfTest: CreateDirectComputeQueue failed (%u)\n",
+                 status);
+    return status;
+  }
+  std::printf("DispatchKernelSelfTest: queue qid=%u doorbell=0x%X mes_backed=%d\n",
+              queue.queue_id, queue.doorbell_index, queue.mes_backed ? 1 : 0);
+  if (wddm_lite_state_ == nullptr) {
+    DestroyDirectComputeQueue(queue);
+    return HSA_STATUS_ERROR;
+  }
+  WddmLiteState& s = *wddm_lite_state_;
+
+  // 2. Stage the kernel GPUVM (code + kernarg + output + 4-level page table +
+  //    GCVM_CONTEXT0). skipMecReassert=true: the direct HQD is already active
+  //    from CreateDirectComputeQueue, so do NOT pulse-reset the MEC pipes.
+  WddmKernelStage stage;
+  if (!wddmStageKernelGpuvm(s.gpu, s.ipd, s.ctx, WindowsFirmwareDir(), stage,
+                            /*skipMecReassert=*/true)) {
+    std::fprintf(stderr, "DispatchKernelSelfTest: wddmStageKernelGpuvm failed\n");
+    DestroyDirectComputeQueue(queue);
+    return HSA_STATUS_ERROR;
+  }
+
+  // 3. Fence buffer (FB-MC addressable + CPU-mapped), separate from the queue.
+  void* fence_cpu = nullptr;
+  uint64_t fence_gpu = 0, fence_handle = 0;
+  if (!wddmAllocVram(s.gpu, 4096, &fence_cpu, &fence_gpu, &fence_handle)) {
+    std::fprintf(stderr, "DispatchKernelSelfTest: fence alloc failed\n");
+    DestroyDirectComputeQueue(queue);
+    return HSA_STATUS_ERROR;
+  }
+  volatile uint64_t* fence = static_cast<volatile uint64_t*>(fence_cpu);
+  *fence = 0;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  FlushHdp();
+
+  // 4. Build the dispatch PM4 (RELEASE_MEM writes 1 to fence_gpu) and submit it
+  //    through this driver's queue.
+  std::vector<uint32_t> pm4;
+  if (!wddmBuildKernelDispatchPm4(stage, fence_gpu, pm4)) {
+    std::fprintf(stderr, "DispatchKernelSelfTest: wddmBuildKernelDispatchPm4 failed\n");
+    DestroyDirectComputeQueue(queue);
+    return HSA_STATUS_ERROR;
+  }
+  std::printf("DispatchKernelSelfTest: dispatch PM4 = %zu dwords\n", pm4.size());
+  status = SubmitDirectCompute(queue, pm4.data(), pm4.size());
+  if (status != HSA_STATUS_SUCCESS) {
+    std::fprintf(stderr, "DispatchKernelSelfTest: SubmitDirectCompute failed (%u)\n",
+                 status);
+    DestroyDirectComputeQueue(queue);
+    return status;
+  }
+
+  // 5. Poll the RELEASE_MEM fence (5 s).
+  bool signaled = false;
+  for (int i = 0; i < 5000; ++i) {
+    if (*fence == 1) { signaled = true; break; }
+    ::Sleep(1);
+  }
+  FlushHdp();
+
+  // 6. GPUVM fault status + output verification.
+  uint32_t fault_status = 0;
+  ReadMmio32(stage.gcBase0, 0x15D0, &fault_status);
+  const volatile uint32_t* out =
+      static_cast<const volatile uint32_t*>(stage.outCpu);
+  uint32_t nbad = 0, first_bad = 0, first_bad_val = 0;
+  for (uint32_t i = 0; i < stage.fillN; ++i) {
+    uint32_t v = out[i];
+    if (v != stage.fillVal) {
+      if (nbad == 0) { first_bad = i; first_bad_val = v; }
+      ++nbad;
+    }
+  }
+  std::printf("DispatchKernelSelfTest: FAULT_STATUS=0x%08X FENCE=%llu (exp 1) "
+              "out[0]=0x%08X exp=0x%08X bad=%u/%u\n",
+              fault_status, static_cast<unsigned long long>(*fence), out[0],
+              stage.fillVal, nbad, stage.fillN);
+  if (nbad)
+    std::printf("DispatchKernelSelfTest: first mismatch at %u: 0x%08X\n",
+                first_bad, first_bad_val);
+
+  DestroyDirectComputeQueue(queue);
+
+  const bool pass = signaled && fault_status == 0 && nbad == 0;
+  std::printf("WINDOWSLITEDRIVER KERN %s\n",
+              pass ? "PASS (fence signaled, no fault, output verified)"
+                   : (!signaled ? "FAIL (fence timeout)"
+                                : (fault_status ? "FAIL (GPUVM fault)"
+                                                : "FAIL (output mismatch)")));
+  return pass ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
 }
 
 // ---- queue / sharing / SPM / misc: not supported by the lite:: backend ------

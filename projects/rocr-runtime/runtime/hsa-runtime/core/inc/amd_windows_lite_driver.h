@@ -216,6 +216,15 @@ class WindowsLiteDriver final : public core::Driver,
                                uint64_t scratch_base_256,
                                uint32_t tmpring_size) const;
 
+  /// @brief Bring-up validation (Windows only; NOT part of the HSA API).
+  /// Stages fill_kernel_raw.co from the firmware dir, dispatches it through a
+  /// direct compute queue created by THIS driver (CreateDirectComputeQueue ->
+  /// SubmitDirectCompute -> the shared lite:: path over wddm_lite), and verifies
+  /// out[0..N] == 0xDEADBEEF. Logs progress to stdout. Returns
+  /// HSA_STATUS_SUCCESS iff the RELEASE_MEM fence signaled, the GPUVM fault
+  /// status is 0, and every output dword verified.
+  hsa_status_t DispatchKernelSelfTest();
+
  private:
   // Cached AMDGPU_ESCAPE_GET_INFO results, populated on Open().
   struct DeviceInfo {
