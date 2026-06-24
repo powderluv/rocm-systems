@@ -704,6 +704,52 @@ void MacOsDriver::SleepUs(uint32_t usec) const {
   ::usleep(usec);
 }
 
+hsa_status_t MacOsDriver::ReadMesUcodeEntry(uint64_t* entry) const {
+  if (entry == nullptr) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  // ROCR_MACOS_MES_FW overrides the firmware path; otherwise use the gfx1201
+  // uni_mes blob shipped with linux-firmware. mes_firmware_header_v1_0 stores
+  // ucode_start_addr_lo/hi at byte offset 56/60 (matches ring_init.py/wddmStartMes).
+  const char* fw_override = std::getenv("ROCR_MACOS_MES_FW");
+  const char* fw_path =
+      (fw_override != nullptr && fw_override[0] != '\0')
+          ? fw_override
+          : "/Users/anush/firmware/linux-firmware/amdgpu/gc_12_0_1_uni_mes.bin";
+  std::FILE* f = std::fopen(fw_path, "rb");
+  if (f == nullptr) {
+    std::fprintf(stderr,
+                 "ROCR macOS MES: cannot open uni_mes firmware '%s' (errno=%d); "
+                 "set ROCR_MACOS_MES_FW to the gc_12_0_1_uni_mes.bin path\n",
+                 fw_path, errno);
+    return HSA_STATUS_ERROR;
+  }
+  constexpr long kEntryOffset = 56;
+  uint32_t words[2] = {0, 0};
+  hsa_status_t status = HSA_STATUS_SUCCESS;
+  if (std::fseek(f, kEntryOffset, SEEK_SET) != 0 ||
+      std::fread(words, sizeof(uint32_t), 2, f) != 2) {
+    std::fprintf(stderr,
+                 "ROCR macOS MES: short read of ucode_start_addr from '%s'\n",
+                 fw_path);
+    status = HSA_STATUS_ERROR;
+  }
+  std::fclose(f);
+  if (status != HSA_STATUS_SUCCESS) return status;
+  // Little-endian lo/hi -> 64-bit entry (mirrors _mes_entry / cqUcodeStart).
+  *entry = (static_cast<uint64_t>(words[1]) << 32) | words[0];
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t MacOsDriver::EnsureMesEngineStartedLocked() {
+  if (mes_engine_started_) return HSA_STATUS_SUCCESS;
+  uint64_t mes_entry = 0;
+  hsa_status_t status = ReadMesUcodeEntry(&mes_entry);
+  if (status != HSA_STATUS_SUCCESS) return status;
+  status = lite::StartMesEngine(*this, mes_entry, MacDirectQueueOptions());
+  if (status != HSA_STATUS_SUCCESS) return status;
+  mes_engine_started_ = true;
+  return HSA_STATUS_SUCCESS;
+}
+
 hsa_status_t MacOsDriver::CreateDirectComputeQueue(DirectComputeQueue* queue) {
   if (queue == nullptr) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   std::lock_guard<std::mutex> g(gpu_lock_);
@@ -711,9 +757,18 @@ hsa_status_t MacOsDriver::CreateDirectComputeQueue(DirectComputeQueue* queue) {
   if (status != HSA_STATUS_SUCCESS) return status;
   if (next_direct_queue_index_ >= 8) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
 
+  // MES path only (ROCR_MACOS_USE_MES_QUEUE): start the MES engine before the
+  // queue is created so lite::EnsureMesScheduler finds the pipes ACTIVE. The
+  // proven direct path (flag unset) skips this entirely and is byte-identical.
+  const lite::DirectQueueOptions options = MacDirectQueueOptions();
+  if (options.use_mes_queue) {
+    status = EnsureMesEngineStartedLocked();
+    if (status != HSA_STATUS_SUCCESS) return status;
+  }
+
   const uint32_t queue_index = next_direct_queue_index_++;
   status = lite::CreateDirectQueue(*this, queue, queue_index, framebuffer_base_,
-                                   MacDirectQueueOptions());
+                                   options);
   if (status != HSA_STATUS_SUCCESS) {
     --next_direct_queue_index_;
     *queue = {};

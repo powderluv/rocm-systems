@@ -148,6 +148,17 @@ hsa_status_t SetDirectQueueScratch(const DirectQueuePlatform& platform,
                                    uint32_t tmpring_size,
                                    const DirectQueueOptions& options);
 
+// Release the MES engine (clear reset/halt, set PIPE0/1_ACTIVE) when the
+// firmware autoloaded the MES ucode but left the engine halted (macOS/Windows
+// have no kernel-driver MES start). mes_entry is the ucode entry PC (the
+// 64-bit ucode_start_addr from the uni_mes firmware header); the engine pipes
+// are programmed with mes_entry >> 2. Returns HSA_STATUS_SUCCESS when both MES
+// pipes latch ACTIVE. Must run before EnsureMesScheduler / the first
+// use_mes_queue CreateDirectQueue. No-op-safe to skip on the direct path.
+hsa_status_t StartMesEngine(const DirectQueuePlatform& platform,
+                            uint64_t mes_entry,
+                            const DirectQueueOptions& options);
+
 }  // namespace lite
 }  // namespace AMD
 }  // namespace rocr

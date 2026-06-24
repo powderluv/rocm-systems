@@ -56,6 +56,11 @@ constexpr uint32_t regCP_HQD_DEQUEUE_STATUS = 0x1fe8;
 constexpr uint32_t regCP_UNMAPPED_DOORBELL = 0x0880;
 constexpr uint32_t regSCRATCH_REG0 = 0x2040;
 constexpr uint32_t regCP_MES_CNTL = 0x2807;
+// MES engine-start registers (base_idx 1, mirrors ring_init.py / wddmStartMes).
+constexpr uint32_t regCP_MES_PRGRM_CNTR_START = 0x2800;
+constexpr uint32_t regCP_MES_PRGRM_CNTR_START_HI = 0x289d;
+constexpr uint32_t regCP_MES_HEADER_DUMP = 0x280d;
+constexpr uint32_t regCP_MES_INSTR_PNTR = 0x2813;
 constexpr uint32_t regCP_MES_DOORBELL_CONTROL1 = 0x283c;
 constexpr uint32_t regCP_MES_DOORBELL_CONTROL2 = 0x283d;
 constexpr uint32_t regCP_MES_DOORBELL_CONTROL3 = 0x283e;
@@ -75,8 +80,14 @@ constexpr uint32_t kCpHqdPqControlPm4 =
 constexpr uint32_t kCpHqdPqControlMes = 0xd8300909;
 constexpr uint32_t kCpHqdDequeueDrainPipe = 0x1;
 constexpr uint32_t kCpHqdDequeueResetWaves = 0x2;
+constexpr uint32_t kCpMesCntlInvalidateIcache = 1u << 4;
+constexpr uint32_t kCpMesCntlPipe0Reset = 1u << 16;
+constexpr uint32_t kCpMesCntlPipe1Reset = 1u << 17;
 constexpr uint32_t kCpMesCntlPipe0Active = 1u << 26;
 constexpr uint32_t kCpMesCntlPipe1Active = 1u << 27;
+constexpr uint32_t kCpMesCntlHalt = 1u << 30;
+// RLC_CP_SCHEDULERS KIQ routing byte: (me=3<<5)|(pipe=1<<3)|(hqd=0)|enable(0x80).
+constexpr uint32_t kRlcCpSchedulersEnable = 0x80u;
 constexpr uint32_t kCpUnmappedDoorbellEnable = 1u << 0;
 constexpr uint32_t kCpUnmappedDoorbellProcLsbMask = 0x00001f00u;
 constexpr uint32_t kCpUnmappedDoorbellProcLsbShift = 8;
@@ -134,6 +145,22 @@ constexpr uint32_t kPacket3MapQueues = 0xa2;
 
 const char* TracePrefix(const DirectQueueOptions& options) {
   return options.trace_prefix ? options.trace_prefix : "ROCR lite direct queue";
+}
+
+// MES doorbell-dead workaround toggle: drive the MES KIQ / mapped compute HQD
+// by MMIO-poking CP_HQD_PQ_WPTR instead of relying on the doorbell. Proven on
+// Windows (ROCR_WINDOWS_MES_MMIO_WPTR); the generic ROCR_MES_MMIO_WPTR lets
+// other transports (macOS) opt in to the same poke. Either flag being set (to a
+// non-empty, non-"0" value) enables it. Default (neither set) = unchanged, so
+// the proven Linux/macOS direct paths are byte-identical.
+bool EnvFlagSet(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool MesMmioWptrPokeEnabled() {
+  return EnvFlagSet("ROCR_WINDOWS_MES_MMIO_WPTR") ||
+         EnvFlagSet("ROCR_MES_MMIO_WPTR");
 }
 
 uint32_t MesHeader(uint32_t opcode) {
@@ -1061,10 +1088,8 @@ hsa_status_t SubmitMesApiFrameOnRing(
   // the MES pipe's CP picks up the wptr and fetches the KIQ ring without a
   // doorbell event. Default (flag unset) = unchanged, so macOS/Linux behave
   // identically. Independent of ROCR_WINDOWS_MES_WPTR_POLL (both can be set).
-  const char* mmio_wptr_env = std::getenv("ROCR_WINDOWS_MES_MMIO_WPTR");
-  const bool mmio_wptr_poke =
-      mmio_wptr_env != nullptr && mmio_wptr_env[0] != '\0' &&
-      std::strcmp(mmio_wptr_env, "0") != 0;
+  // Accepts ROCR_WINDOWS_MES_MMIO_WPTR (Windows) or generic ROCR_MES_MMIO_WPTR.
+  const bool mmio_wptr_poke = MesMmioWptrPokeEnabled();
   if (mmio_wptr_poke) {
     const uint32_t pipe = MesPipeForRing(ring);
     status = SelectHqd(platform, kMesKiqMe, pipe, kMesKiqHqd);
@@ -1775,6 +1800,113 @@ hsa_status_t UnmapLegacyQueueWithMes(const DirectQueuePlatform& platform,
 
 }  // namespace
 
+hsa_status_t StartMesEngine(const DirectQueuePlatform& platform,
+                            uint64_t mes_entry,
+                            const DirectQueueOptions& options) {
+  // Release the MES engine when the firmware autoloaded the ucode but left the
+  // pipes halted (macOS/Windows do not run the kernel-driver MES start). Port of
+  // ring_init.py::_enable_mes_from_ucode / wddmStartMes: the only programmable
+  // input needed (PSP already staged the IC_BASE) is the ucode entry PC, written
+  // to CP_MES_PRGRM_CNTR_START on both pipes. All MES registers live at base_idx
+  // 1 (kGcBase1), matching the Windows base_idx=1 reference.
+  uint32_t mes_cntl_pre = 0;
+  platform.ReadMmio32(kGcBase1, regCP_MES_CNTL, &mes_cntl_pre);
+  uint32_t version_pre = 0;
+  platform.ReadMmio32(kGcBase1, regCP_MES_GP3_LO, &version_pre);
+  if (options.trace) {
+    std::fprintf(stderr,
+                 "%s StartMesEngine entry=0x%llx PC=0x%llx CP_MES_CNTL(pre)="
+                 "0x%08x GP3_LO=0x%08x\n",
+                 TracePrefix(options),
+                 static_cast<unsigned long long>(mes_entry),
+                 static_cast<unsigned long long>(mes_entry >> 2), mes_cntl_pre,
+                 version_pre);
+  }
+
+  // 1. RLC_CP_SCHEDULERS: route the KIQ (me=3 pipe=KIQ hqd=0) + enable bit.
+  uint32_t schedulers = 0;
+  hsa_status_t status =
+      platform.ReadMmio32(kGcBase1, regRLC_CP_SCHEDULERS, &schedulers);
+  if (status != HSA_STATUS_SUCCESS) return status;
+  schedulers &= 0xFFFFFF00u;
+  schedulers |= (kMesKiqMe << 5) | (kMesKiqPipe << 3) | kMesKiqHqd |
+                kRlcCpSchedulersEnable;
+  status = platform.WriteMmio32(kGcBase1, regRLC_CP_SCHEDULERS, schedulers);
+  if (status != HSA_STATUS_SUCCESS) return status;
+
+  // 2. CP_MES_CNTL: clear ACTIVE, set INVALIDATE_ICACHE + PIPE0/1_RESET + HALT.
+  uint32_t val = 0;
+  status = platform.ReadMmio32(kGcBase1, regCP_MES_CNTL, &val);
+  if (status != HSA_STATUS_SUCCESS) return status;
+  val &= ~(kCpMesCntlPipe0Active | kCpMesCntlPipe1Active);
+  val |= (kCpMesCntlInvalidateIcache | kCpMesCntlPipe0Reset |
+          kCpMesCntlPipe1Reset | kCpMesCntlHalt);
+  status = platform.WriteMmio32(kGcBase1, regCP_MES_CNTL, val);
+  if (status != HSA_STATUS_SUCCESS) return status;
+
+  // 3. Per-pipe program counter (both MES pipe0 and pipe1 share the uni_mes
+  //    entry, mirroring bringup.py MES/MES1 = mes_entry).
+  uint32_t active_mask = 0;
+  for (uint32_t pipe = 0; pipe < 2; ++pipe) {
+    status = SelectHqd(platform, kMesKiqMe, pipe, kMesKiqHqd);
+    if (status != HSA_STATUS_SUCCESS) {
+      DeselectHqd(platform);
+      return status;
+    }
+    status = platform.WriteMmio32(kGcBase1, regCP_MES_PRGRM_CNTR_START,
+                                  static_cast<uint32_t>(mes_entry >> 2));
+    if (status == HSA_STATUS_SUCCESS) {
+      status = platform.WriteMmio32(
+          kGcBase1, regCP_MES_PRGRM_CNTR_START_HI,
+          static_cast<uint32_t>((mes_entry >> 2) >> 32));
+    }
+    if (status != HSA_STATUS_SUCCESS) {
+      DeselectHqd(platform);
+      return status;
+    }
+    active_mask |= (pipe == 0) ? kCpMesCntlPipe0Active : kCpMesCntlPipe1Active;
+  }
+  DeselectHqd(platform);
+
+  // 4. CP_MES_CNTL release: clear reset/halt/icache + set PIPE0/1_ACTIVE.
+  status = platform.ReadMmio32(kGcBase1, regCP_MES_CNTL, &val);
+  if (status != HSA_STATUS_SUCCESS) return status;
+  val &= ~(kCpMesCntlInvalidateIcache | kCpMesCntlPipe0Reset |
+           kCpMesCntlPipe1Reset | kCpMesCntlHalt | kCpMesCntlPipe0Active |
+           kCpMesCntlPipe1Active);
+  val |= active_mask;
+  status = platform.WriteMmio32(kGcBase1, regCP_MES_CNTL, val);
+  if (status != HSA_STATUS_SUCCESS) return status;
+  platform.SleepUs(1000);
+
+  // Liveness check: HEADER_DUMP / INSTR_PNTR should change if MES executes.
+  uint32_t hdr0 = 0;
+  uint32_t ip0 = 0;
+  platform.ReadMmio32(kGcBase1, regCP_MES_HEADER_DUMP, &hdr0);
+  platform.ReadMmio32(kGcBase1, regCP_MES_INSTR_PNTR, &ip0);
+  platform.SleepUs(200000);
+  uint32_t hdr1 = 0;
+  uint32_t ip1 = 0;
+  uint32_t mes_cntl_post = 0;
+  platform.ReadMmio32(kGcBase1, regCP_MES_HEADER_DUMP, &hdr1);
+  platform.ReadMmio32(kGcBase1, regCP_MES_INSTR_PNTR, &ip1);
+  platform.ReadMmio32(kGcBase1, regCP_MES_CNTL, &mes_cntl_post);
+
+  const bool pipes_active =
+      (mes_cntl_post & (kCpMesCntlPipe0Active | kCpMesCntlPipe1Active)) ==
+      (kCpMesCntlPipe0Active | kCpMesCntlPipe1Active);
+  const bool mes_alive = (hdr0 != hdr1) || (ip1 != 0);
+  if (options.trace) {
+    std::fprintf(stderr,
+                 "%s StartMesEngine CP_MES_CNTL(post)=0x%08x pipes_active=%s "
+                 "HEADER_DUMP 0x%08x->0x%08x INSTR_PNTR 0x%08x->0x%08x MES %s\n",
+                 TracePrefix(options), mes_cntl_post,
+                 pipes_active ? "set" : "NOT-set", hdr0, hdr1, ip0, ip1,
+                 mes_alive ? "RUNNING" : "NOT visibly executing");
+  }
+  return pipes_active ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
+}
+
 uint32_t DirectQueuePipe(uint32_t queue_index) { return queue_index / 4; }
 
 uint32_t DirectQueueHqd(uint32_t queue_index) { return queue_index % 4; }
@@ -2392,10 +2524,8 @@ hsa_status_t SubmitDirectQueue(const DirectQueuePlatform& platform,
     // doorbell event. pipe/hqd_queue above are exactly DirectQueuePipe/Hqd(
     // queue_index), i.e. the slot the MES mapped. Default (flag unset) keeps the
     // doorbell-only behavior so macOS/Linux are unchanged.
-    const char* mes_mmio_wptr_env = std::getenv("ROCR_WINDOWS_MES_MMIO_WPTR");
-    const bool mes_mmio_wptr_poke =
-        mes_mmio_wptr_env != nullptr && mes_mmio_wptr_env[0] != '\0' &&
-        std::strcmp(mes_mmio_wptr_env, "0") != 0;
+    // Accepts ROCR_WINDOWS_MES_MMIO_WPTR (Windows) or generic ROCR_MES_MMIO_WPTR.
+    const bool mes_mmio_wptr_poke = MesMmioWptrPokeEnabled();
     if (mes_mmio_wptr_poke) {
       status = SelectHqd(platform, 1, pipe, hqd_queue);
       if (status == HSA_STATUS_SUCCESS) {

@@ -229,6 +229,18 @@ class MacOsDriver final : public core::Driver, private lite::DirectQueuePlatform
 
   hsa_status_t EnsureBarMappingsLocked();
 
+  // MES path (ROCR_MACOS_USE_MES_QUEUE): the DEXT autoloads the MES ucode via
+  // PSP but never releases the engine, so lite::EnsureMesScheduler would bail on
+  // the halted pipes. Read the ucode entry PC from the uni_mes firmware file and
+  // call lite::StartMesEngine to flip the pipes ACTIVE. Runs at most once
+  // (guarded by mes_engine_started_), under gpu_lock_, before the first
+  // use_mes_queue CreateDirectQueue. Only invoked on the MES path; the proven
+  // direct path never calls it.
+  hsa_status_t EnsureMesEngineStartedLocked();
+  // Resolve the gc_<gc>_uni_mes.bin path (ROCR_MACOS_MES_FW override, else the
+  // built-in default) and read the 64-bit ucode_start_addr at header offset 56.
+  hsa_status_t ReadMesUcodeEntry(uint64_t* entry) const;
+
   hsa_status_t EnsureDoorbellAperture() const override;
   hsa_status_t ReadMmio32(uint32_t base, uint32_t reg,
                           uint32_t* value) const override;
@@ -261,6 +273,9 @@ class MacOsDriver final : public core::Driver, private lite::DirectQueuePlatform
   uint64_t framebuffer_base_ = 0;
   uint64_t next_vram_offset_ = 0;
   uint32_t next_direct_queue_index_ = 0;
+  // MES path: true once lite::StartMesEngine has latched the MES pipes ACTIVE,
+  // so EnsureMesEngineStartedLocked is idempotent across queue creations.
+  bool mes_engine_started_ = false;
   std::unordered_map<void*, VramAllocation> vram_allocations_;
   // cpu_addr -> DART DMA buffer, for coherent-data device allocations.
   std::unordered_map<void*, DmaAllocation> dma_allocations_;
