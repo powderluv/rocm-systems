@@ -223,8 +223,15 @@ if(__HIP_ENABLE_PCH)
   target_sources(amdhip64 PRIVATE ${CMAKE_BINARY_DIR}/hip_pch.o)
 endif()
 
-# Add hiprtc
-add_subdirectory(hiprtc)
+# Add hiprtc (gated for the initial Windows ROCr-backend bring-up: hiprtc needs ROCm
+# clang + llvm-mc at build time, absent on a plain MSVC host, and is not needed for
+# loading pre-finalized code objects. Default ON; pass -DHIP_BUILD_HIPRTC=OFF to skip.)
+if(NOT DEFINED HIP_BUILD_HIPRTC)
+  set(HIP_BUILD_HIPRTC ON)
+endif()
+if(HIP_BUILD_HIPRTC)
+  add_subdirectory(hiprtc)
+endif()
 
 #############################
 # Profiling API support
