@@ -55,6 +55,17 @@ bool Comgr::LoadLib(bool is_versioned) {
                     WINDOWS_SWITCH(comgr_versioned_name.c_str(), "libamd_comgr.so.3"));
     cep_.handle = Os::loadLibrary(comgr_lib_name);
 #endif
+    // Fallback for a lite/standalone build: if the HIP-version-stamped comgr
+    // (amd_comgr<maj><min>.dll) is not present next to amdhip64, load the
+    // interface-versioned name (amd_comgr_<INTERFACE_MAJOR>.dll), which is
+    // comgr's canonical filename. Mirrors the macOS multi-name fallback loop.
+    if (cep_.handle == nullptr) {
+      std::string comgr_fallback_dll =
+          "amd_comgr_" + std::to_string(AMD_COMGR_INTERFACE_VERSION_MAJOR) + ".dll";
+      cep_.handle = Os::loadLibrary(
+          LP64_SWITCH(WINDOWS_SWITCH("amd_comgr32.dll", "libamd_comgr32.so.3"),
+                      WINDOWS_SWITCH(comgr_fallback_dll.c_str(), "libamd_comgr.so.3")));
+    }
   } else {
     std::string comgr_major_dll =
         "amd_comgr_" + std::to_string(AMD_COMGR_INTERFACE_VERSION_MAJOR) + ".dll";
