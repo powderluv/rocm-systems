@@ -749,6 +749,29 @@ hsa_status_t WindowsLiteDriver::AllocateVram(size_t size, size_t align, void** c
   if ((align & (align - 1)) != 0) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
 
   std::lock_guard<std::mutex> g(gpu_lock_);
+  // When bring-up went through wddm_lite (discovered via the probe -> adapter_==0,
+  // so the amdgpu_mcdm BAR window in EnsureBarMappingsLocked is unavailable),
+  // allocate VRAM through the proven wddm_lite bump allocator -- the SAME cursor the
+  // lite:: queue uses, so no collision. Record it in vram_allocations_ keyed by the
+  // returned CPU pointer so HostToGpuAddress/IsRegisteredVramPointer can translate it
+  // (each wddm_lite alloc is its own MAP_VRAM mapping, not a slice of one window).
+  if (wddm_lite_state_ != nullptr && wddm_lite_state_->brought_up) {
+    const uint64_t rounded_lite = AlignUpU64(size, align);
+    void* cpu = nullptr;
+    uint64_t gpu = 0, handle = 0;
+    if (!wddmAllocVram(wddm_lite_state_->gpu, rounded_lite, &cpu, &gpu, &handle)) {
+      return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    }
+    VramAllocation alloc;
+    alloc.offset = 0;
+    alloc.size = rounded_lite;
+    alloc.gpu_addr = gpu;
+    vram_allocations_[cpu] = alloc;
+    *cpu_addr = cpu;
+    *gpu_addr = gpu;
+    return HSA_STATUS_SUCCESS;
+  }
+
   hsa_status_t status = EnsureBarMappingsLocked();
   if (status != HSA_STATUS_SUCCESS) return status;
 
@@ -781,6 +804,14 @@ hsa_status_t WindowsLiteDriver::HostToGpuAddress(const void* ptr, uint64_t* gpu_
       return HSA_STATUS_SUCCESS;
     }
   }
+  // wddm_lite VRAM allocations (each its own MAP_VRAM mapping).
+  for (const auto& kv : vram_allocations_) {
+    const auto vbase = reinterpret_cast<uintptr_t>(kv.first);
+    if (dp >= vbase && dp < vbase + kv.second.size) {
+      *gpu_addr = kv.second.gpu_addr + (dp - vbase);
+      return HSA_STATUS_SUCCESS;
+    }
+  }
   if (vram_bar_cpu_ == nullptr || framebuffer_base_ == 0) {
     return HSA_STATUS_ERROR_INVALID_ALLOCATION;
   }
@@ -795,6 +826,10 @@ bool WindowsLiteDriver::IsRegisteredVramPointer(const void* ptr) const {
   std::lock_guard<std::mutex> g(gpu_lock_);
   const auto p = reinterpret_cast<uintptr_t>(ptr);
   for (const auto& kv : dma_allocations_) {
+    const auto base = reinterpret_cast<uintptr_t>(kv.first);
+    if (p >= base && p < base + kv.second.size) return true;
+  }
+  for (const auto& kv : vram_allocations_) {
     const auto base = reinterpret_cast<uintptr_t>(kv.first);
     if (p >= base && p < base + kv.second.size) return true;
   }

@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
-#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <thread>
@@ -297,7 +296,7 @@ WindowsAqlQueue::WindowsAqlQueue(core::SharedQueue* shared_queue, WindowsGpuAgen
   marker_cpu_ = static_cast<volatile uint32_t*>(marker_cpu_base_);
   *marker_cpu_ = 0;
 
-  status = driver_.AllocateVram(1024 * 1024, 4096, &scratch_cpu_, &scratch_gpu_);
+  status = driver_.AllocateVram(64 * 1024, 4096, &scratch_cpu_, &scratch_gpu_);
   if (status != HSA_STATUS_SUCCESS) {
     driver_.FreeMemory(marker_cpu_base_, 4096);
     driver_.DestroyDirectComputeQueue(direct_queue_);
@@ -305,7 +304,7 @@ WindowsAqlQueue::WindowsAqlQueue(core::SharedQueue* shared_queue, WindowsGpuAgen
     ring_buf_ = nullptr;
     throw hsa_exception(status, "Could not allocate Darwin dispatch scratch");
   }
-  scratch_size_ = 1024 * 1024;
+  scratch_size_ = 64 * 1024;
   scratch_offset_ = 0;
 
   amd_queue_.hsa_queue.type = HSA_QUEUE_TYPE_MULTI;
