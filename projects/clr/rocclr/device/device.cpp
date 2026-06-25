@@ -674,11 +674,16 @@ bool Device::init() {
   devices_ = nullptr;
   appProfile_.init();
 
+#if defined(WITH_PAL_DEVICE)
   if (IS_WINDOWS && flagIsDefault(GPU_ENABLE_PAL)) {
     // On Windows by default keep PAL path for now, until we completely switch to ROCr backend
-    // Without this, roc::Device::init() returns true & disables PAL path in below code
+    // Without this, roc::Device::init() returns true & disables PAL path in below code.
+    // Only do this when a PAL backend is actually built: an HSA-only build (the lite::
+    // WindowsLiteDriver, WITH_PAL_DEVICE off) has no PAL path, so forcing the default to 1
+    // here would skip roc::Device::init (it runs only for PAL==0/2) and leave zero devices.
     GPU_ENABLE_PAL = 1;
   }
+#endif  // WITH_PAL_DEVICE
 
 // IMPORTANT: Note that we are initialiing HSA stack first and then
 // GPU stack. The order of initialization is signiicant and if changed
