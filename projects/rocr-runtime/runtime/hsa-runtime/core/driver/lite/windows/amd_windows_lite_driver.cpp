@@ -147,6 +147,13 @@ lite::DirectQueueOptions WindowsDirectQueueOptions() {
   options.trace_verbose = TraceDirectQueueVerbose();
   // First pass: direct HQD, no MES. Matches the pre-MES macOS/Linux bring-up.
   options.use_mes_queue = std::getenv("ROCR_WINDOWS_USE_MES_QUEUE") != nullptr;
+  // Without a KMD to reset queues on process exit, an HQD activated by a
+  // prior process stays active across runs (and the bring-up deliberately
+  // skips re-bootload for repeatability). Reclaim a stale active HQD on a
+  // fresh queue create, mirroring macOS (AMD_GPU_MACOS_FORCE_DIRECT_COMPUTE)
+  // and Linux (ROCR_AMDGPU_LITE_FORCE_DIRECT_COMPUTE).
+  options.force_reclaim =
+      std::getenv("ROCR_WINDOWS_FORCE_DIRECT_COMPUTE") != nullptr;
   options.trace_prefix = "ROCR windows direct queue";
   return options;
 }

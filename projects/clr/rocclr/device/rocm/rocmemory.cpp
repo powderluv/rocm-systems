@@ -872,10 +872,12 @@ bool Buffer::create(bool alloc_local) {
         flags.contiguous_ = (memFlags & ROCCLR_MEM_HSA_CONTIGUOUS) != 0;
         flags.uncached_ = (memFlags & ROCCLR_MEM_HSA_UNCACHED) != 0;
         deviceMemory_ = dev().deviceLocalAlloc(size(), flags);
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
         if (deviceMemory_ != nullptr) {
           // Darwin's MVP device-local allocation is backed by CPU-visible
           // memory, so host blits must not recurse through an indirect map.
+          // The Windows WindowsLiteDriver maps device-local VRAM into the
+          // CPU-visible BAR window, so the same direct host blit applies.
           flags_ |= HostMemoryDirectAccess;
         }
 #endif
@@ -984,9 +986,11 @@ bool Buffer::create(bool alloc_local) {
         const_cast<Device&>(dev()).updateFreeMemory(size(), false);
       }
     } else {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
       // Darwin's MVP local-memory pool is host-backed until the DEXT path
       // exposes GPU VM/VRAM allocations, so CPU blits can access it directly.
+      // The Windows WindowsLiteDriver likewise exposes device-local memory
+      // through the CPU-visible BAR window.
       flags_ |= HostMemoryDirectAccess;
 #endif
       const_cast<Device&>(dev()).updateFreeMemory(size(), false);
