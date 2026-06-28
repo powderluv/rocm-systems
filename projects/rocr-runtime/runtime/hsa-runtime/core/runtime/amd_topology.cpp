@@ -407,6 +407,17 @@ void SurfaceGpuList(const std::vector<GpuNodeSelection>& gpu_list, bool xnack_mo
         core::g_use_interrupt_wait = false;
       }
 #endif
+#if defined(_WIN32)
+      if (selection.driver_type == core::DriverType::WINDOWS_WDDM_LITE) {
+        // wddm_lite (amdgpu_mcdm via D3DKMTEscape) provides none of the KFD
+        // event ioctls that InterruptSignal / the exception-monitor async
+        // thread rely on, so the interrupt-wait machinery
+        // (hsaKmtWaitOnMultipleEvents) dereferences bogus event state and
+        // crashes a background thread. Use CPU-side polling/default signals,
+        // mirroring the macOS/Linux lite paths.
+        core::g_use_interrupt_wait = false;
+      }
+#endif
 
       if (core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
         core::Runtime::runtime_singleton_->flag().disable_image(true);

@@ -353,7 +353,11 @@ bool RegionMemory::Freeze() {
     core::Runtime::runtime_singleton_->flag().co_dmacopy_size();
 
   const bool isGpuDevice = (agent->device_type() == core::Agent::kAmdGpuDevice);
-#if defined(__APPLE__)
+  // WindowsGpuAgent (lite::) inherits GpuAgentInt, not AMD::GpuAgent, so the
+  // reinterpret_cast<AMD::GpuAgent*> in the #else branch reads past the object.
+  // Take the same always-DmaCopy path as macOS: WindowsLiteDriver::DmaCopy is a
+  // CPU blit into the CPU-visible BAR VRAM window.
+#if defined(__APPLE__) || defined(_WIN32)
   const bool isLargeBarDisabled = false;
   const bool shouldDmaCopy = isGpuDevice;
 #else
@@ -365,7 +369,7 @@ bool RegionMemory::Freeze() {
       if (HSA_STATUS_SUCCESS != agent->DmaCopy(ptr_, host_ptr_, size_)) return false;
   } else {
       memcpy(ptr_, host_ptr_, size_);
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(_WIN32)
       if (is_code_ && isGpuDevice)
         reinterpret_cast<AMD::GpuAgent*>(agent)->PcieWcFlush(ptr_, size_);
 #endif
