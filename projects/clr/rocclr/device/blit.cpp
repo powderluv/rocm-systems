@@ -6,6 +6,7 @@
 
 #include "platform/commandqueue.hpp"
 #include "device/device.hpp"
+#include <cstdlib>
 #include "device/blit.hpp"
 #include "utils/debug.hpp"
 
@@ -587,6 +588,25 @@ bool HostBlitManager::fillBuffer(device::Memory& memory, const void* pattern, si
   if (fillMem == NULL) {
     LogError("Couldn't map destination memory");
     return false;
+  }
+
+  // gfx1201 lite:: device-only VRAM (allocated beyond the CPU-visible BAR)
+  // has no host mapping: cpuMap returns its bare FB-MC address, which is NOT
+  // CPU-dereferenceable, so the memcpy below would fault. When enabled, skip
+  // the CPU fill for such a buffer (detected by the FB-MC range so a real
+  // host/BAR pointer is never skipped). The buffer is left un-zeroed -- valid
+  // only for ops that fully overwrite it (e.g. a beta==0 GEMM workspace).
+  // A GPU-side fill is the proper fix; this env-gated skip is a bring-up
+  // shortcut. Off by default.
+  static const bool kLiteSkipDevOnlyFill =
+      (getenv("ROCR_LITE_DEVICE_ONLY_SKIP_MEMSET") != nullptr);
+  if (kLiteSkipDevOnlyFill) {
+    const uintptr_t fa = reinterpret_cast<uintptr_t>(fillMem);
+    if (fa >= 0x8000000000ull && fa < (0x8000000000ull + (48ull << 30))) {
+      LogWarning("lite:: device-only VRAM fill skipped (buffer left un-zeroed)");
+      memory.cpuUnmap(vDev_);
+      return true;
+    }
   }
 
   size_t offset = origin[0];

@@ -767,7 +767,25 @@ hsa_status_t WindowsLiteDriver::AllocateVram(size_t size, size_t align, void** c
     void* cpu = nullptr;
     uint64_t gpu = 0, handle = 0;
     if (!wddmAllocVram(wddm_lite_state_->gpu, rounded_lite, &cpu, &gpu, &handle)) {
-      return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+      // BAR full / alloc too large for the CPU-visible aperture -> device-only
+      // tier: reserve an MC address beyond the BAR (no CPU mapping). The MC
+      // address is handed back as the opaque handle; HostToGpuAddress /
+      // IsRegisteredVramPointer translate it via the identity entry below
+      // (key == gpu_addr, so gpu_addr + (ptr-key) == ptr). Such a buffer is
+      // NOT CPU-dereferenceable -- host memset/copy must treat it device-only.
+      uint64_t dgpu = 0;
+      if (!wddmAllocVramDeviceOnly(wddm_lite_state_->gpu, rounded_lite, &dgpu)) {
+        return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+      }
+      VramAllocation dalloc;
+      dalloc.offset = 0;
+      dalloc.size = rounded_lite;
+      dalloc.gpu_addr = dgpu;
+      void* handle_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(dgpu));
+      vram_allocations_[handle_ptr] = dalloc;
+      *cpu_addr = handle_ptr;
+      *gpu_addr = dgpu;
+      return HSA_STATUS_SUCCESS;
     }
     VramAllocation alloc;
     alloc.offset = 0;
