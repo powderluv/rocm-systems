@@ -22,7 +22,7 @@ namespace lite {
 
 constexpr uint32_t kMqdSize = 0x1000;
 constexpr uint32_t kMqdDwordCount = kMqdSize / sizeof(uint32_t);
-constexpr uint32_t kDirectComputeRingSize = 0x1000;
+constexpr uint32_t kDirectComputeRingSize = 0x8000;  // 32KB=8192dw (was 0x1000=1024dw). Ring region is [0x2000,0x10000) so 0x8000 is the max power-of-2 that fits below EOP. The 1024-dw ring wrapped at the first boundary-crossing dispatch (966+131) and the MES-backed CP halted at the wrap; 8192dw avoids the wrap for torch dispatches. Proper ring-wrap-at-boundary handling is a follow-up.
 constexpr uint32_t kDirectComputeEopSize = 0x1000;
 constexpr uint32_t kDirectComputeDoorbellBase = 0x20;
 constexpr uint32_t kDirectComputeDoorbellStride = 2;

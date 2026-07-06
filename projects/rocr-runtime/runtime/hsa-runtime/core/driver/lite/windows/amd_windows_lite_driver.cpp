@@ -93,6 +93,7 @@ struct WddmLiteState {
   IpDiscoveryResult ipd{};
   WddmComputeContext ctx{};
   bool brought_up = false;
+  bool mes_engine_started = false;
   // Cache of per-index doorbell BAR2 mappings (mapBar(2, idx*4, 8)).
   struct DoorbellMap {
     uint32_t index;
@@ -385,6 +386,10 @@ hsa_status_t WindowsLiteDriver::EnsureGpuBringUpLocked() {
   if (!gmcInit(s.gpu, s.ipd, gmc) || gmc.vramSize == 0) {
     return HSA_STATUS_ERROR;
   }
+
+  // Report the real total VRAM (~32GB) so hipMemGetInfo / free stop reporting 0.
+  // Do NOT touch info_.visible_vram_size -- it sizes the 256MB MAP_VRAM window.
+  info_.vram_size = gmc.vramSize;
 
   // 3. recipeBootload (-> BOOTLOAD_COMPLETE) + NBIO doorbell aperture +
   //    cqInitGfxForCompute (MEC enable). Seeds the VRAM bump allocator.
@@ -777,6 +782,8 @@ hsa_status_t WindowsLiteDriver::AllocateVram(size_t size, size_t align, void** c
       if (!wddmAllocVramDeviceOnly(wddm_lite_state_->gpu, rounded_lite, &dgpu)) {
         return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
       }
+      std::fprintf(stderr, "ROCR lite:: DEVICE-ONLY alloc size=%zu mc=0x%llx\n",
+                   (size_t)rounded_lite, (unsigned long long)dgpu);
       VramAllocation dalloc;
       dalloc.offset = 0;
       dalloc.size = rounded_lite;
@@ -1062,6 +1069,23 @@ void WindowsLiteDriver::SleepUs(uint32_t usec) const {
 
 // ---- direct-compute queue wrappers ------------------------------------------
 
+hsa_status_t WindowsLiteDriver::EnsureMesEngineStartedLocked() {
+  if (wddm_lite_state_ == nullptr) return HSA_STATUS_ERROR;
+  auto& s = *wddm_lite_state_;
+  if (s.mes_engine_started) return HSA_STATUS_SUCCESS;
+  // A MES-backed queue MAP_QUEUES has no running MES to service it unless the
+  // MES engine was started first (else the map times out, status=4096). The
+  // standalone harness (lite_direct_queue_test mes) and the macOS driver both
+  // start it before the first MES-backed map; do the same here, once, via the
+  // proven wddmStartMes (ring_init.py::_enable_mes_from_ucode).
+  if (!wddmStartMes(s.gpu, s.ipd, WindowsFirmwareDir(), s.ctx)) {
+    std::fprintf(stderr, "ROCR lite:: EnsureMesEngineStarted: wddmStartMes failed\n");
+    return HSA_STATUS_ERROR;
+  }
+  s.mes_engine_started = true;
+  return HSA_STATUS_SUCCESS;
+}
+
 hsa_status_t WindowsLiteDriver::CreateDirectComputeQueue(DirectComputeQueue* queue) {
   if (queue == nullptr) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   std::lock_guard<std::mutex> g(gpu_lock_);
@@ -1071,6 +1095,12 @@ hsa_status_t WindowsLiteDriver::CreateDirectComputeQueue(DirectComputeQueue* que
   hsa_status_t status = EnsureGpuBringUpLocked();
   if (status != HSA_STATUS_SUCCESS) {
     status = EnsureBarMappingsLocked();
+    if (status != HSA_STATUS_SUCCESS) return status;
+  }
+  // MES-backed queues (ROCR_WINDOWS_USE_MES_QUEUE) need the MES engine running
+  // before MAP_QUEUES, else the map times out (status=4096).
+  if (WindowsDirectQueueOptions().use_mes_queue) {
+    status = EnsureMesEngineStartedLocked();
     if (status != HSA_STATUS_SUCCESS) return status;
   }
   if (next_direct_queue_index_ >= 8) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;

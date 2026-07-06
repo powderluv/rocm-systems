@@ -72,7 +72,9 @@ constexpr uint32_t kScratchGranularity = 256;
 // num_cu * MaxSlotsScratchCU. 64 * 32 = 2048, fits the 12-bit WAVES field.
 constexpr uint32_t kGfx1201NumCu = 64;
 constexpr uint32_t kMaxSlotsScratchCU = 32;
-constexpr uint32_t kScratchMaxWaves = kGfx1201NumCu * kMaxSlotsScratchCU;
+constexpr uint32_t kScratchMaxWaves = 32u;  // match the proven wddm_lite direct-HQD
+// scratch recipe (SCR_WAVES=32); 64*32=2048 is unvalidated on gfx1201 and inflates the
+// scratch backing 64x (forcing device-only fallback). See gpu_init.cpp recipeScratchDispatch.
 // Over-allocate the backing buffer to cover per-shader-engine scratch striping
 // (the exact wave->offset layout is the one item to confirm on hardware); cheap
 // insurance against an out-of-bounds scratch access faulting the CP.
@@ -135,6 +137,31 @@ void WriteData(std::vector<uint32_t>& pm4, uint64_t addr, uint32_t value) {
                            ((WRITE_DATA_ENGINE_SEL_ME & 0x3u) << 30) |
                            WRITE_DATA_WR_CONFIRM;
   Pkt3(pm4, PACKET3_WRITE_DATA, {control, Low32(addr), High32(addr), value});
+}
+
+// gfx12 bottom-of-pipe EOP timestamp with a full GCR cache flush (GL2 WB/INV +
+// scratch drain), writing a 64-bit fence to `addr` only after the dispatch and
+// its register-spill scratch writeback fully retire. Copied bit-exact from
+// wddm_lite gpu_init.cpp pm4ReleaseMemFence (proven to retire a register-
+// spilling kernel where a bare CS_PARTIAL_FLUSH + rptr/marker poll hangs).
+void ReleaseMemFence(std::vector<uint32_t>& pm4, uint64_t addr, uint64_t value) {
+  constexpr uint32_t kEventCacheFlushInvTs = 0x14;  // CACHE_FLUSH_AND_INV_TS_EVENT
+  constexpr uint32_t kEventIndexEop = 5;            // RELEASE_MEM_EVENT_INDEX_EOP
+  constexpr uint32_t kDataSelSend64 = 2;            // DATA_SEL_SEND_64BIT
+  constexpr uint32_t kIntSelOnConfirm = 2;          // INT_SEL_SEND_INT_ON_CONFIRM
+  const uint32_t kGcr = (1u << 12) |  // GLM_WB
+                        (1u << 13) |  // GLM_INV
+                        (1u << 14) |  // GLV_INV
+                        (1u << 15) |  // GL1_INV
+                        (1u << 20) |  // GL2_INV
+                        (1u << 21) |  // GL2_WB
+                        (1u << 22);   // SEQ
+  const uint32_t dw0 = (kEventCacheFlushInvTs & 0x3Fu) |
+                       ((kEventIndexEop & 0xFu) << 8) | kGcr;
+  const uint32_t dw1 = ((kDataSelSend64 & 0x7u) << 29) |
+                       ((kIntSelOnConfirm & 0x3u) << 24);
+  Pkt3(pm4, 0x49u /*PACKET3_RELEASE_MEM*/,
+       {dw0, dw1, Low32(addr), High32(addr), Low32(value), High32(value), 0u});
 }
 
 uint32_t FullRangeGcrCntl() {
@@ -610,8 +637,23 @@ hsa_status_t WindowsAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& p
   // that. Take the larger of packet and descriptor sizes. (RSRC2.ENABLE_PRIVATE_
   // SEGMENT can be set with a zero fixed size and no real spilling, so it is not
   // used as the trigger.)
-  const uint32_t scratch_bytes_per_thread = std::max<uint32_t>(
+  uint32_t scratch_bytes_per_thread = std::max<uint32_t>(
       packet.private_segment_size, kd->private_segment_fixed_size);
+  // DIAG + candidate fix: the observed tmpring=0x2020 implies spt~16, but a
+  // register-spilling GEMM may need more (KD psfs possibly misread on Windows).
+  // Log the two inputs separately, and allow forcing a per-thread floor to test
+  // the under-sized-scratch-hang hypothesis without guessing the exact psfs.
+  if (const char* ov = std::getenv("ROCR_WINDOWS_SCRATCH_BYTES")) {
+    const uint32_t o = static_cast<uint32_t>(std::atoi(ov));
+    if (o != 0 && scratch_bytes_per_thread != 0)
+      scratch_bytes_per_thread = std::max<uint32_t>(scratch_bytes_per_thread, o);
+  }
+  if (TraceAql()) {
+    std::fprintf(stderr,
+                 "ROCR macOS AQL scratch-inputs pkt.pss=%u kd.psfs=%u -> spt=%u\n",
+                 packet.private_segment_size, kd->private_segment_fixed_size,
+                 scratch_bytes_per_thread);
+  }
   const bool wants_scratch = scratch_bytes_per_thread != 0;
   if (wants_scratch && !enable_scratch) {
     return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
@@ -777,7 +819,14 @@ hsa_status_t WindowsAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& p
            {0, 0, 0, packet.workgroup_size_x, packet.workgroup_size_y,
             packet.workgroup_size_z, 0, 0});
   DispatchDirect(pm4, dispatch_dim_x, dispatch_dim_y, dispatch_dim_z, dispatch_initiator);
-  EventWrite(pm4, CS_PARTIAL_FLUSH, EVENT_INDEX_CS_PARTIAL_FLUSH);
+  // HW-confirmed: on the MES-backed queue the CP parks AT CS_PARTIAL_FLUSH for a
+  // register-spilling wave (GPU idle, no fault) and never reaches the terminal
+  // RELEASE_MEM. With the EOP-fence path the RELEASE_MEM(EOP) is a bottom-of-pipe
+  // event that already waits for the wave (incl. scratch) to retire, so this
+  // CS_PARTIAL_FLUSH barrier is both unnecessary and the blocker -- skip it.
+  if (!EnvEnabled("ROCR_WINDOWS_AQL_EOP_FENCE")) {
+    EventWrite(pm4, CS_PARTIAL_FLUSH, EVENT_INDEX_CS_PARTIAL_FLUSH);
+  }
   // Post-dispatch GL2 writeback+invalidate so the kernel's results reach VRAM and
   // are visible to the host blit. MUST default ON: without it the kernel's output
   // stays in L2 and the host reads stale VRAM (e.g. hipBLAS SAXPY returns the
@@ -833,7 +882,19 @@ hsa_status_t WindowsAqlQueue::SubmitBarrier(const hsa_barrier_and_packet_t& pack
 hsa_status_t WindowsAqlQueue::SubmitPm4AndWait(const std::vector<uint32_t>& input_pm4) {
   std::vector<uint32_t> pm4 = input_pm4;
   const bool rptr_only = EnvEnabled("ROCR_MACOS_AQL_RPTR_ONLY");
-  if (!rptr_only) {
+  const bool eop_fence = EnvEnabled("ROCR_WINDOWS_AQL_EOP_FENCE");
+  if (eop_fence) {
+    // Terminal EOP RELEASE_MEM fence (mirrors the proven wddm_lite 3c scratch
+    // completion). The bottom-of-pipe TS fires only after the wave's scratch
+    // writeback drains, so a register-spilling GEMM retires -- a bare
+    // CS_PARTIAL_FLUSH + rptr poll never observes that drain and the CP hangs.
+    // Completion is the fence value alone (rptr does not advance past the
+    // stalled CS_PARTIAL_FLUSH). Reuses the 4KB marker page as the 64-bit fence.
+    marker_value_++;
+    if (marker_value_ == 0) marker_value_ = 1;
+    *marker_cpu_ = 0;
+    ReleaseMemFence(pm4, marker_gpu_, marker_value_);
+  } else if (!rptr_only) {
     marker_value_++;
     if (marker_value_ == 0) marker_value_ = 1;
     *marker_cpu_ = 0;
@@ -869,6 +930,18 @@ hsa_status_t WindowsAqlQueue::SubmitPm4AndWait(const std::vector<uint32_t>& inpu
   const uint32_t expected_rptr = static_cast<uint32_t>(mono_wptr);
   bool rptr_done = false;
   for (uint32_t i = 0; i < 50000; ++i) {
+    if (eop_fence) {
+      if (*marker_cpu_ == marker_value_) {
+        if (TraceAql()) {
+          std::fprintf(stderr,
+                       "ROCR macOS PM4 complete via EOP fence marker=%u\n",
+                       marker_value_);
+        }
+        return HSA_STATUS_SUCCESS;
+      }
+      ::Sleep(1);
+      continue;
+    }
     uint32_t hw_rptr = 0;
     if (driver_.ReadDirectComputeRptr(direct_queue_, &hw_rptr) == HSA_STATUS_SUCCESS) {
       uint64_t mono_rptr = (mono_wptr - (mono_wptr % ring_dw)) + hw_rptr;

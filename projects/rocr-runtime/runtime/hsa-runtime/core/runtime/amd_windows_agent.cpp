@@ -246,6 +246,21 @@ hsa_status_t WindowsGpuAgent::DmaCopy(void* dst, const void* src, size_t size) {
   if ((dst == nullptr && size != 0) || (src == nullptr && size != 0)) {
     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   }
+  // Device-only lite:: VRAM (allocated beyond the CPU-visible BAR) is NOT
+  // host-dereferenceable; a host memcpy into/out of it faults (0xC0000005).
+  // Detect by the FB-MC address range and fail cleanly rather than crash.
+  // TODO: a GPU-side (SDMA/PM4) copy would make device-only buffers usable.
+  {
+    const auto da = reinterpret_cast<uintptr_t>(dst);
+    const auto sa = reinterpret_cast<uintptr_t>(src);
+    const uintptr_t lo = 0x8000000000ull, hi = 0x8000000000ull + (48ull << 30);
+    if ((da >= lo && da < hi) || (sa >= lo && sa < hi)) {
+      std::fprintf(stderr,
+                   "ROCR lite:: DmaCopy device-only VRAM not host-copyable (dst=%p src=%p size=%zu)\n",
+                   dst, src, size);
+      return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    }
+  }
   const bool trace = std::getenv("ROCR_MACOS_TRACE_DMA_COPY") != nullptr;
   auto* d8 = static_cast<volatile uint8_t*>(dst);
   const auto* s8 = static_cast<const uint8_t*>(src);

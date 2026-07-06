@@ -306,6 +306,7 @@ class WindowsLiteDriver final : public core::Driver,
   std::unique_ptr<WddmLiteState> wddm_lite_state_;
   // Brings the GPU to BOOTLOAD_COMPLETE + MEC enabled via wddm_lite. Idempotent.
   hsa_status_t EnsureGpuBringUpLocked();
+  hsa_status_t EnsureMesEngineStartedLocked();
 };
 
 }  // namespace AMD

@@ -27,6 +27,13 @@ constexpr uint32_t kGcBase0 = 0x1260;
 constexpr uint32_t kGcBase1 = 0xA000;
 
 constexpr uint32_t regGRBM_GFX_CNTL = 0x0900;
+constexpr uint32_t regSH_MEM_BASES = 0x09E3;   // base_idx 1 (kGcBase1)
+constexpr uint32_t regSH_MEM_CONFIG = 0x09E4;  // base_idx 1 (kGcBase1)
+constexpr uint32_t kShMemBasesGfx12 = 0x00010002u;   // (shared_base<<16)|private_base(2)
+constexpr uint32_t kShMemConfigGfx12 = 0x0000C00Cu;  // ALIGN_UNALIGNED(3<<2)|INIT_PREFETCH(3<<14)
+constexpr uint32_t regGCVM_L2_PROTECTION_FAULT_STATUS = 0x15D0;     // base_idx 0 (kGcBase0)
+constexpr uint32_t regGCVM_L2_PROTECTION_FAULT_ADDR_LO32 = 0x15D2;  // base_idx 0
+constexpr uint32_t regGCVM_L2_PROTECTION_FAULT_ADDR_HI32 = 0x15D3;  // base_idx 0
 constexpr uint32_t regCP_MQD_BASE_ADDR = 0x1fa9;
 constexpr uint32_t regCP_MQD_BASE_ADDR_HI = 0x1faa;
 constexpr uint32_t regCP_HQD_ACTIVE = 0x1fab;
@@ -55,6 +62,11 @@ constexpr uint32_t regCP_HQD_PQ_WPTR_HI = 0x1fe0;
 constexpr uint32_t regCP_HQD_DEQUEUE_STATUS = 0x1fe8;
 constexpr uint32_t regCP_UNMAPPED_DOORBELL = 0x0880;
 constexpr uint32_t regSCRATCH_REG0 = 0x2040;
+// mmGRBM_STATUS: absolute BAR0 DWORD 0x0050 (base_idx 0 -> use base=0, NOT
+// gc-base-relative). Global shader/CP-busy status; bit31 GUI_ACTIVE, bit29
+// CP_BUSY, bit22 SPI_BUSY. Verified in-repo: wddm_lite_test.cpp readReg32(
+// 0x0050 * 4). Read as ReadMmio32(/*base=*/0, regGRBM_STATUS_ABS, &v).
+constexpr uint32_t regGRBM_STATUS_ABS = 0x0050;
 constexpr uint32_t regCP_MES_CNTL = 0x2807;
 // MES engine-start registers (base_idx 1, mirrors ring_init.py / wddmStartMes).
 constexpr uint32_t regCP_MES_PRGRM_CNTR_START = 0x2800;
@@ -161,6 +173,40 @@ bool EnvFlagSet(const char* name) {
 bool MesMmioWptrPokeEnabled() {
   return EnvFlagSet("ROCR_WINDOWS_MES_MMIO_WPTR") ||
          EnvFlagSet("ROCR_MES_MMIO_WPTR");
+}
+
+// Windows WDDM/passthrough only: host-activate the MES scheduler ring's HQD
+// (me=3,pipe=0) with the WPTR_POLL workaround, exactly like the KIQ. Without it
+// the software MAP_SCHEDULER alone never brings pipe-0 online (rptr stays 0 and
+// the scheduler SET_HW_RESOURCES times out -> MES map status=4096). Off by
+// default so macOS/Linux (live doorbell) are unaffected.
+bool MesActivateSchedulerHqdEnabled() {
+  return EnvFlagSet("ROCR_WINDOWS_MES_ACTIVATE_SCHED_HQD");
+}
+
+// Windows-only: program the gfx12 SH_MEM private/scratch aperture (needed for
+// architected flat scratch on a register-spilling kernel). Default ON wherever
+// the MES mmio-wptr poke is on; override via ROCR_WINDOWS_SHMEM_APERTURE.
+bool ShMemApertureEnabled() {
+  const char* v = std::getenv("ROCR_WINDOWS_SHMEM_APERTURE");
+  if (v == nullptr) v = std::getenv("ROCR_SHMEM_APERTURE");
+  if (v != nullptr && v[0] != '\0') return v[0] != '0';
+  return MesMmioWptrPokeEnabled();
+}
+
+// Windows MES-backed scratch (#57): skip the SetDirectQueueScratch REMOVE_QUEUE
+// + ADD_QUEUE(map_legacy) remap. HW showed the remap freezes the already-working
+// compute HQD (rptr stalls at the pre-scratch wptr, CP_PQ_WPTR_POLL_CNTL reset,
+// no GPUVM fault) so the first register-spilling dispatch is never consumed.
+// Scratch is already carried PER-DISPATCH by the AQL translator's SET_SH_REG of
+// COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI + COMPUTE_TMPRING_SIZE (amd_windows_aql_
+// queue.cpp:763-767, same registers/values proven on the direct-HQD path in
+// gpu_init.cpp), so the remap is not what programs scratch. The MQD scratch-
+// field patch + SH_MEM re-assert + fault-status clear still run (harmless, and
+// keep the MQD correct for any later state reload). Off by default so the
+// existing remap path is byte-identical unless opted in.
+bool SkipScratchRemapEnabled() {
+  return EnvFlagSet("ROCR_WINDOWS_SKIP_SCRATCH_REMAP");
 }
 
 uint32_t MesHeader(uint32_t opcode) {
@@ -293,6 +339,184 @@ hsa_status_t SelectHqd(const DirectQueuePlatform& platform, uint32_t me,
 
 hsa_status_t DeselectHqd(const DirectQueuePlatform& platform) {
   return platform.WriteMmio32(kGcBase1, regGRBM_GFX_CNTL, 0);
+}
+
+// Program the gfx12 per-VMID SH_MEM private (scratch) aperture for all 16
+// VMIDs, mirroring the proven gpu_init.cpp cqInitGfxForCompute / ring_init.py:
+// grbm-select each VMID (vmid in GRBM_GFX_CNTL[7:4]) then write SH_MEM_CONFIG +
+// SH_MEM_BASES (base_idx 1). Absent this, a spilling kernel FLAT_SCRATCH -> VA0
+// -> GCVM permission fault -> CP hang. Restores grbm to vmid 0 on exit.
+hsa_status_t ProgramShMemAllVmids(const DirectQueuePlatform& platform) {
+  for (uint32_t vmid = 0; vmid < 16; ++vmid) {
+    hsa_status_t status =
+        platform.WriteMmio32(kGcBase1, regGRBM_GFX_CNTL, (vmid & 0xFu) << 4);
+    if (status != HSA_STATUS_SUCCESS) return status;
+    status = platform.WriteMmio32(kGcBase1, regSH_MEM_CONFIG, kShMemConfigGfx12);
+    if (status != HSA_STATUS_SUCCESS) return status;
+    status = platform.WriteMmio32(kGcBase1, regSH_MEM_BASES, kShMemBasesGfx12);
+    if (status != HSA_STATUS_SUCCESS) return status;
+  }
+  return platform.WriteMmio32(kGcBase1, regGRBM_GFX_CNTL, 0);
+}
+
+// Read the global GCVM L2 protection fault status + address (write-to-clear).
+// Diagnoses the scratch CP stall: fault_va=0 => aperture still wrong; fault_va
+// == scratch VA => backing not GPUVM-mapped; status=0 => not a VM fault.
+void TraceScratchFault(const DirectQueuePlatform& platform, const char* tag,
+                       const DirectQueueOptions& options) {
+  uint32_t fs = 0, fa_lo = 0, fa_hi = 0;
+  platform.ReadMmio32(kGcBase0, regGCVM_L2_PROTECTION_FAULT_STATUS, &fs);
+  platform.ReadMmio32(kGcBase0, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32, &fa_lo);
+  platform.ReadMmio32(kGcBase0, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32, &fa_hi);
+  const uint64_t va = ((static_cast<uint64_t>(fa_hi) << 32) | fa_lo) << 12;
+  std::fprintf(stderr,
+               "%s scratch-fault-probe[%s] fault_status=0x%08x [walker=%u "
+               "perm=0x%x] fault_va=0x%llx\n",
+               TracePrefix(options), tag, fs,
+               static_cast<unsigned>((fs >> 1) & 0x7u),
+               static_cast<unsigned>((fs >> 4) & 0xFu),
+               static_cast<unsigned long long>(va));
+}
+
+// MAX-INFO stall probe for the MES-backed spilling-dispatch hang (#57). Called
+// with the compute HQD already GRBM-selected (me=1,pipe,hqd). Answers: is the CP
+// stuck FETCHING (no wave) or is a spilling WAVE hung (no GPUVM fault)? Reads
+// only verified offsets/bases:
+//   (a) ring CONTENTS at the frozen rptr  -- host memory, NO MMIO
+//   (b) GRBM_STATUS (abs DWORD 0x0050, base 0) -- shader/CP busy vs idle
+//   (c) report-page rptr (host) vs CP_HQD_PQ_RPTR register (MMIO, selected HQD)
+[[maybe_unused]] void TraceStallMaxInfo(const DirectQueuePlatform& platform,
+                       const DirectQueueState& queue, const char* tag,
+                       const DirectQueueOptions& options) {
+  // (c) register rptr under the already-selected compute HQD.
+  uint32_t hw_rptr = 0;
+  platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_RPTR, &hw_rptr);
+  const uint64_t report_rptr = queue.rptr_cpu != nullptr ? *queue.rptr_cpu : 0;
+
+  // (b) GRBM_STATUS: absolute mmGRBM_STATUS DWORD 0x0050 (base 0), the only
+  // in-repo-verified shader-busy register (wddm_lite_test.cpp). Raw word is
+  // printed; the bit decode is advisory only.
+  uint32_t grbm_status = 0;
+  platform.ReadMmio32(/*base=*/0, regGRBM_STATUS_ABS, &grbm_status);
+  const unsigned gui_active = (grbm_status >> 31) & 0x1u;  // any GUI work
+  const unsigned cp_busy = (grbm_status >> 29) & 0x1u;     // CP busy
+  const unsigned spi_busy = (grbm_status >> 22) & 0x1u;    // SPI busy
+
+  // (a) ring dwords at the frozen read pointer. rptr is a DWORD index into the
+  // ring; use the register value (register wins if the report page is stale).
+  // NO MMIO -- pure host reads of the mapped ring.
+  const uint64_t ring_dw =
+      queue.ring_size_bytes != 0 ? queue.ring_size_bytes / sizeof(uint32_t) : 0;
+  uint32_t r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (queue.ring_cpu != nullptr && ring_dw != 0) {
+    const uint64_t b = hw_rptr % ring_dw;
+    for (uint64_t i = 0; i < 8; ++i) r[i] = queue.ring_cpu[(b + i) % ring_dw];
+  }
+
+  std::fprintf(stderr,
+               "%s stall-maxinfo[%s] hw_rptr=0x%x report_rptr=%llu "
+               "rptr_match=%d grbm_status=0x%08x [gui=%u cp=%u spi=%u] "
+               "ring[rptr..+8]=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,"
+               "0x%08x,0x%08x\n",
+               TracePrefix(options), tag, hw_rptr,
+               static_cast<unsigned long long>(report_rptr),
+               (report_rptr == hw_rptr) ? 1 : 0, grbm_status, gui_active,
+               cp_busy, spi_busy, r[0], r[1], r[2], r[3], r[4], r[5], r[6],
+               r[7]);
+}
+
+// SETTLED stall+fault probe for the MES-backed spilling GEMM dispatch (#57).
+// Called with the compute HQD already GRBM-selected (me=1,pipe,hqd). The old
+// two-probe sequence read the fault regs after a fixed 3ms SleepUs, which on
+// the LAST (scratch) submit fires while the CP is still mid-consume (rptr=966
+// of the 73-dword block) -- BEFORE the DISPATCH_DIRECT launches the spilling
+// wave. Here we first POLL CP_HQD_PQ_RPTR until the CP reaches the target
+// wptr (drained) or the read pointer stops advancing for kSettleReads reads
+// (stalled), capped at ~500ms, THEN read -- at that settled point -- the GCVM
+// fault status+VA, GRBM_STATUS, and ring[rptr..+8]. So the scratch dispatch's
+// own probe captures the 1019 hang (CP parked at DISPATCH_DIRECT / the post-
+// dispatch fence). Reuses only in-repo-verified regs/bases; the HQD must be
+// selected on entry (caller SelectHqd's it; DeselectHqd stays with the caller).
+void TraceSettledStall(const DirectQueuePlatform& platform,
+                       const DirectQueueState& queue, uint64_t target_wptr,
+                       const char* tag, const DirectQueueOptions& options) {
+  // Poll CP_HQD_PQ_RPTR until drained (rptr == target) or settled (rptr
+  // unchanged for kSettleReads consecutive reads), whichever comes first.
+  // ~500ms cap: kMaxReads iterations * kPollUs between reads.
+  constexpr uint32_t kPollUs = 2000;    // 2ms per poll step
+  constexpr uint32_t kMaxReads = 250;   // 250 * 2ms = ~500ms cap
+  constexpr uint32_t kSettleReads = 8;  // frozen for 8 reads (~16ms) => stalled
+  const uint64_t ring_dw =
+      queue.ring_size_bytes != 0 ? queue.ring_size_bytes / sizeof(uint32_t) : 0;
+  const uint32_t target_rptr =
+      ring_dw != 0 ? static_cast<uint32_t>(target_wptr % ring_dw) : 0;
+  uint32_t hw_rptr = 0;
+  platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_RPTR, &hw_rptr);
+  uint32_t last_rptr = hw_rptr;
+  uint32_t unchanged = 0;
+  uint32_t reads = 0;
+  bool drained = false;
+  bool settled = false;
+  for (reads = 0; reads < kMaxReads; ++reads) {
+    if (ring_dw != 0 && hw_rptr == target_rptr) {
+      drained = true;
+      break;
+    }
+    if (hw_rptr == last_rptr) {
+      if (++unchanged >= kSettleReads) {
+        settled = true;
+        break;
+      }
+    } else {
+      unchanged = 0;
+      last_rptr = hw_rptr;
+    }
+    platform.SleepUs(kPollUs);
+    platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_RPTR, &hw_rptr);
+  }
+
+  // Settled point reached: read the GCVM fault regs (merged from the old
+  // TraceScratchFault) -- status=0 => not a VM fault (fence hang), va ==
+  // scratch VA => backing not GPUVM-mapped.
+  uint32_t fs = 0, fa_lo = 0, fa_hi = 0;
+  platform.ReadMmio32(kGcBase0, regGCVM_L2_PROTECTION_FAULT_STATUS, &fs);
+  platform.ReadMmio32(kGcBase0, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32, &fa_lo);
+  platform.ReadMmio32(kGcBase0, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32, &fa_hi);
+  const uint64_t fault_va = ((static_cast<uint64_t>(fa_hi) << 32) | fa_lo) << 12;
+
+  // GRBM_STATUS: absolute mmGRBM_STATUS DWORD 0x0050 (base 0). grbm busy +
+  // rptr short of target => spilling wave launched and hung (the 1019 case).
+  uint32_t grbm_status = 0;
+  platform.ReadMmio32(/*base=*/0, regGRBM_STATUS_ABS, &grbm_status);
+  const unsigned gui_active = (grbm_status >> 31) & 0x1u;
+  const unsigned cp_busy = (grbm_status >> 29) & 0x1u;
+  const unsigned spi_busy = (grbm_status >> 22) & 0x1u;
+
+  // ring dwords at the frozen read pointer (host reads, NO MMIO); the packet
+  // the CP is parked on -- expect the DISPATCH_DIRECT / fence tail.
+  uint32_t r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (queue.ring_cpu != nullptr && ring_dw != 0) {
+    const uint64_t b = hw_rptr % ring_dw;
+    for (uint64_t i = 0; i < 8; ++i) r[i] = queue.ring_cpu[(b + i) % ring_dw];
+  }
+
+  const uint64_t report_rptr = queue.rptr_cpu != nullptr ? *queue.rptr_cpu : 0;
+  std::fprintf(stderr,
+               "%s settled-stall[%s] state=%s reads=%u hw_rptr=0x%x "
+               "target_rptr=0x%x report_rptr=%llu grbm_status=0x%08x "
+               "[gui=%u cp=%u spi=%u] fault_status=0x%08x [walker=%u "
+               "perm=0x%x] fault_va=0x%llx "
+               "ring[rptr..+8]=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,"
+               "0x%08x,0x%08x\n",
+               TracePrefix(options), tag,
+               drained ? "drained" : (settled ? "stalled" : "timeout"),
+               reads, hw_rptr, target_rptr,
+               static_cast<unsigned long long>(report_rptr), grbm_status,
+               gui_active, cp_busy, spi_busy, fs,
+               static_cast<unsigned>((fs >> 1) & 0x7u),
+               static_cast<unsigned>((fs >> 4) & 0xFu),
+               static_cast<unsigned long long>(fault_va), r[0], r[1], r[2],
+               r[3], r[4], r[5], r[6], r[7]);
 }
 
 hsa_status_t WaitForDirectHqdIdle(const DirectQueuePlatform& platform,
@@ -610,7 +834,8 @@ hsa_status_t ProgramMesQueueRegisters(const DirectQueuePlatform& platform,
                                       uint32_t pipe,
                                       const DirectQueueMqd& mqd,
                                       const DirectQueueOptions& options,
-                                      const char* label) {
+                                      const char* label,
+                                      bool set_active) {
   hsa_status_t status = SelectHqd(platform, kMesKiqMe, pipe, kMesKiqHqd);
   if (status != HSA_STATUS_SUCCESS) return status;
 
@@ -690,7 +915,7 @@ hsa_status_t ProgramMesQueueRegisters(const DirectQueuePlatform& platform,
       !write(kGcBase0, regCP_HQD_PQ_DOORBELL_CONTROL, mqd[0x8F]) ||
       !write(kGcBase0, regCP_HQD_PERSISTENT_STATE, mqd[0x84]) ||
       !write(kGcBase0, regCP_HQD_GFX_CONTROL, kCpHqdGfxControlDbUpdatedMsgEn) ||
-      !write(kGcBase0, regCP_HQD_ACTIVE, 1)) {
+      (set_active && !write(kGcBase0, regCP_HQD_ACTIVE, 1))) {
     DeselectHqd(platform);
     return status;
   }
@@ -706,7 +931,7 @@ hsa_status_t ProgramMesQueueRegisters(const DirectQueuePlatform& platform,
   status = platform.ReadMmio32(kGcBase0, regCP_HQD_ACTIVE, &active);
   DeselectHqd(platform);
   if (status != HSA_STATUS_SUCCESS) return status;
-  if (active == 0) {
+  if (active == 0 && set_active) {
     if (options.trace) {
       std::fprintf(stderr,
                    "%s %s activation failed me=%u pipe=%u hqd=%u\n",
@@ -1638,7 +1863,7 @@ hsa_status_t EnsureMesScheduler(const DirectQueuePlatform& platform,
   }
 
   status = ProgramMesQueueRegisters(platform, kMesKiqPipe, kiq_mqd, options,
-                                    "MES KIQ");
+                                    "MES KIQ", /*set_active=*/true);
   if (status != HSA_STATUS_SUCCESS) {
     ResetMesSchedulerState(platform, state);
     return status;
@@ -1682,6 +1907,22 @@ hsa_status_t EnsureMesScheduler(const DirectQueuePlatform& platform,
         state.next_fence_value, kiq_set_hw1, kMesApiStatusSetHwResources1Dw,
         options,
         "KIQ SET_HW_RESOURCES_1");
+  }
+  // Program the scheduler ring's HQD image on pipe 0 (MQD registers + WPTR_POLL)
+  // WITHOUT setting CP_HQD_ACTIVE: MES owns/activates it via the MAP_SCHEDULER
+  // below (mirrors the proven Python direct_activate=False recipe). On
+  // WDDM/passthrough the scheduler ring was otherwise never programmed on pipe 0,
+  // so MES never serviced it and its rptr stayed 0 (SET_HW_RESOURCES timeout ->
+  // MES map status=4096). Gated Windows-only.
+  if (status == HSA_STATUS_SUCCESS && MesActivateSchedulerHqdEnabled()) {
+    const uint32_t sched_pipe = MesPipeForRing(state.ring);
+    status = ProgramMesQueueRegisters(platform, sched_pipe, scheduler_mqd,
+                                      options, "MES SCHEDULER",
+                                      /*set_active=*/false);
+    if (status != HSA_STATUS_SUCCESS) {
+      ResetMesSchedulerState(platform, state);
+      return status;
+    }
   }
   if (status == HSA_STATUS_SUCCESS) {
     auto map_scheduler = BuildMesMapLegacySchedulerFrame(scheduler_layout);
@@ -2022,7 +2263,7 @@ hsa_status_t CreateDirectQueue(const DirectQueuePlatform& platform,
     *queue = {};
     return HSA_STATUS_ERROR;
   }
-  if (active != 0) {
+  if (active != 0 && !options.use_mes_queue) {
     status = ReclaimActiveHqd(platform, *queue, options, "activate-reclaim");
     if (status != HSA_STATUS_SUCCESS) {
       DeselectHqd(platform);
@@ -2392,6 +2633,17 @@ hsa_status_t SetDirectQueueScratch(const DirectQueuePlatform& platform,
   // for any spilling kernel. Patch the MQD's saved scratch fields so the restore
   // carries the real values. v12 compute MQD dwords: compute_dispatch_scratch_
   // base_lo/hi = 0x11/0x12 (backing VA >> 8), compute_tmpring_size = 0x19.
+  if (ShMemApertureEnabled()) {  // both MES + direct paths: SH_MEM needed for any scratch
+    hsa_status_t sh = ProgramShMemAllVmids(platform);
+    if (options.trace) {
+      std::fprintf(stderr,
+                   "%s set-scratch program-shmem all-vmids bases=0x%08x "
+                   "config=0x%08x status=%u\n",
+                   TracePrefix(options), kShMemBasesGfx12,
+                   kShMemConfigGfx12, sh);
+    }
+    if (sh != HSA_STATUS_SUCCESS) return sh;
+  }
   hsa_status_t status = WriteLayoutMemory32(
       platform, queue.layout, queue.layout.mqd_offset + 0x11 * 4,
       static_cast<uint32_t>(scratch_base_256));
@@ -2419,11 +2671,49 @@ hsa_status_t SetDirectQueueScratch(const DirectQueuePlatform& platform,
   // MES-backed queue that is REMOVE_QUEUE + ADD_QUEUE(map_legacy). (A direct
   // HQD would need a dequeue + re-activate; not used on the MES path.)
   if (queue.mes_backed) {
-    status = UnmapLegacyQueueWithMes(platform, queue, options);
-    if (status != HSA_STATUS_SUCCESS) return status;
-    status = MapLegacyQueueWithMes(platform, queue, queue.layout,
-                                   queue.framebuffer_base, options);
-    if (status != HSA_STATUS_SUCCESS) return status;
+    // Skip the REMOVE/ADD remap when gated (#57): it resets the compute pipe's
+    // wptr-poll and freezes the already-advancing HQD, and scratch is programmed
+    // per-dispatch via SET_SH_REG (not via the MQD reload the remap would force,
+    // see amd_windows_aql_queue.cpp:763-767). The MQD patch above still ran, so
+    // any later state reload carries the correct scratch base.
+    const bool skip_remap = SkipScratchRemapEnabled();
+    if (!skip_remap) {
+      status = UnmapLegacyQueueWithMes(platform, queue, options);
+      if (status != HSA_STATUS_SUCCESS) return status;
+      status = MapLegacyQueueWithMes(platform, queue, queue.layout,
+                                     queue.framebuffer_base, options);
+      if (status != HSA_STATUS_SUCCESS) return status;
+    } else if (options.trace) {
+      std::fprintf(stderr,
+                   "%s set-scratch skip-remap (no REMOVE/ADD) qid=%u\n",
+                   TracePrefix(options), queue.queue_id);
+    }
+    // The MES REMOVE/ADD remap resets CP_PQ_WPTR_POLL_CNTL on the compute
+    // pipe, so the doorbell-dead MMIO wptr poke stops advancing the CP
+    // (rptr freezes, no GPUVM fault). Re-assert the wptr-poll enable on the
+    // re-mapped compute HQD so the poke advances the CP again. Windows-only.
+    if (MesMmioWptrPokeEnabled()) {
+      const uint32_t cpipe = DirectQueuePipe(queue.queue_index);
+      const uint32_t chqd = DirectQueueHqd(queue.queue_index);
+      if (SelectHqd(platform, 1, cpipe, chqd) == HSA_STATUS_SUCCESS) {
+        platform.WriteMmio32(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, 1u);
+        DeselectHqd(platform);
+        if (options.trace) {
+          std::fprintf(stderr,
+                       "%s set-scratch reassert wptr-poll me=1 pipe=%u hqd=%u\n",
+                       TracePrefix(options), cpipe, chqd);
+        }
+      }
+    }
+    // Re-assert SH_MEM after the remap (proven recipe re-asserts post-map)
+    // and clear the GCVM fault status so the per-submit probe captures a
+    // FRESH scratch fault from the first spilling dispatch.
+    if (ShMemApertureEnabled()) {
+      status = ProgramShMemAllVmids(platform);
+      if (status != HSA_STATUS_SUCCESS) return status;
+      platform.WriteMmio32(kGcBase0, regGCVM_L2_PROTECTION_FAULT_STATUS, 0);
+      if (options.trace) TraceScratchFault(platform, "post-remap", options);
+    }
   }
   return HSA_STATUS_SUCCESS;
 }
@@ -2543,17 +2833,27 @@ hsa_status_t SubmitDirectQueue(const DirectQueuePlatform& platform,
         uint32_t poke_rptr = 0;
         uint32_t poke_wptr = 0;
         uint32_t poke_wptr_hi = 0;
+        uint32_t poke_poll = 0;
         platform.ReadMmio32(kGcBase0, regCP_HQD_ACTIVE, &poke_active);
+        platform.ReadMmio32(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, &poke_poll);
         platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_RPTR, &poke_rptr);
         platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_WPTR_LO, &poke_wptr);
         platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_WPTR_HI, &poke_wptr_hi);
         std::fprintf(stderr,
                      "%s MES-backed mmio-wptr poke me=1 pipe=%u hqd=%u "
                      "new_wptr=%llu active=0x%x rptr=0x%x wptr=0x%08x:%08x "
-                     "status=%u\n",
+                     "poll_cntl=0x%x status=%u\n",
                      TracePrefix(options), pipe, hqd_queue,
                      static_cast<unsigned long long>(new_wptr), poke_active,
-                     poke_rptr, poke_wptr_hi, poke_wptr, status);
+                     poke_rptr, poke_wptr_hi, poke_wptr, poke_poll, status);
+        // Settled stall+fault probe (#57): runs while the compute HQD is
+        // still GRBM-selected (CP_HQD_PQ_RPTR readable). Polls the read
+        // pointer until the CP drains to new_wptr or parks (settles), then
+        // reads GCVM fault + GRBM_STATUS + ring[rptr..+8] AT that point -- so
+        // the scratch dispatch's own probe captures the 1019 hang rather than
+        // sampling at rptr=966 mid-consume. Merges the old TraceStallMaxInfo +
+        // post-sleep TraceScratchFault into one settled read.
+        TraceSettledStall(platform, queue, new_wptr, "mes-scratch", options);
       }
       DeselectHqd(platform);
       if (status != HSA_STATUS_SUCCESS) return status;
@@ -2570,6 +2870,10 @@ hsa_status_t SubmitDirectQueue(const DirectQueuePlatform& platform,
                    static_cast<unsigned long long>(new_wptr),
                    static_cast<unsigned long long>(rptr));
     }
+    // The settled stall+fault probe above (TraceSettledStall, under the
+    // selected HQD) already captured the scratch dispatch hang at its settled
+    // read pointer; the old fixed-3ms post-deselect probe only ever sampled
+    // mid-consume (rptr=966) and is removed.
     return HSA_STATUS_SUCCESS;
   }
 
