@@ -2925,6 +2925,12 @@ hsa_status_t SubmitDirectQueue(const DirectQueuePlatform& platform,
                  "wptr=0x%08x:%08x status=%u\n",
                  TracePrefix(options), queue.queue_id, active, rptr, mmio_wptr_hi,
                  mmio_wptr, status);
+    // Direct-path scratch stall probe (#57 / macOS #15): the direct HQD had no
+    // stall probe before (only the MES-backed submit did). Settle-poll the CP
+    // while the compute HQD is still grbm-selected to capture where a spilling
+    // wave parks -- rptr / GRBM idle bits / GCVM fault status / ring packet --
+    // instead of sampling mid-consume.
+    TraceSettledStall(platform, queue, new_wptr, "direct-scratch", options);
   }
   DeselectHqd(platform);
   if (status != HSA_STATUS_SUCCESS) return status;
