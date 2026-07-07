@@ -811,8 +811,16 @@ hsa_status_t WindowsAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& p
     if (resource_zero) {
       SetShReg(pm4, COMPUTE_RESOURCE_LIMITS, {0});
     } else {
+      // gfx12 interleaves COMPUTE_TMPRING_SIZE (0x2E18) between the
+      // STATIC_THREAD_MGMT_SE registers (0x2E15 LIMITS, 0x2E16 SE0, 0x2E17 SE1,
+      // 0x2E18 TMPRING, 0x2E19 SE2, 0x2E1A SE3), so this contiguous 6-dword block
+      // writes 0 into TMPRING and silently zeroes the scratch ring size --
+      // killing every register-spilling wave (SPI grants no scratch slot -> wave
+      // never launches -> CP parks, GRBM idle, no fault). #57 / macOS #15. Keep
+      // the block (SE thread-mgmt intent) but re-assert TMPRING right after it.
       SetShReg(pm4, COMPUTE_RESOURCE_LIMITS,
                {0x3ff, 0xffffffff, 0xffffffff, 0, 0xffffffff, 0xffffffff});
+      SetShReg(pm4, COMPUTE_TMPRING_SIZE, {compute_tmpring_size});
     }
   }
   SetShReg(pm4, COMPUTE_START_X,
