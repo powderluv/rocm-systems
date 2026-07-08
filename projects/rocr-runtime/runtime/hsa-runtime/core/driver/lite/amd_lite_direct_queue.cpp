@@ -2191,7 +2191,11 @@ DirectQueueMqd BuildPm4DirectQueueMqd(const DirectQueueLayout& layout,
   mqd[0x8E] = static_cast<uint32_t>(layout.wptr_gpu >> 32) & 0xFFFFu;
   mqd[0x8F] = ((doorbell_index & 0x03FFFFFFu) << 2) | (1u << 30);
 
-  mqd[0x91] = kCpHqdPqControlPm4;
+  // QUEUE_SIZE (CP_HQD_PQ_CONTROL[5:0]) must track the ring buffer, else the HQD
+  // wraps rptr at the encoded size while ROCr writes the full ring -> stall at the
+  // boundary (the ~14-dispatch ceiling: hardcoded 9=1024dw vs kDirectComputeRingSize=8192dw).
+  mqd[0x91] = (kCpHqdPqControlPm4 & ~0x3fu) |
+              (QueueSizeField(kDirectComputeRingSize) & 0x3fu);
   mqd[0x95] = 0x00300000;
   mqd[0xA2] = 0x100;
   mqd[0xB8] = 1u << 15;
