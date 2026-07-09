@@ -304,10 +304,6 @@ class WindowsLiteDriver final : public core::Driver,
   // until Init() succeeds; the overrides fall back to the amdgpu_mcdm escape
   // path (above) when null so the scaffold still links/runs without bring-up.
   std::unique_ptr<WddmLiteState> wddm_lite_state_;
-  // Set once Close()/ShutDown() runs; blocks bring-up re-entry on this same
-  // driver object during process teardown (#63). A fresh hipDeviceReset/new
-  // process gets a new object (closed_=false) so real resets are unaffected.
-  bool closed_ = false;
   // Brings the GPU to BOOTLOAD_COMPLETE + MEC enabled via wddm_lite. Idempotent.
   hsa_status_t EnsureGpuBringUpLocked();
   hsa_status_t EnsureMesEngineStartedLocked();
