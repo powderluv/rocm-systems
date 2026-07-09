@@ -360,8 +360,25 @@ hsa_status_t WindowsLiteDriver::Init() {
 hsa_status_t WindowsLiteDriver::ShutDown() { return Close(); }
 
 hsa_status_t WindowsLiteDriver::EnsureGpuBringUpLocked() {
+  // After Close()/ShutDown, do NOT re-run the bring-up recipe. Teardown was
+  // re-entering here on the same object (Close reset wddm_lite_state_), re-loading
+  // firmware and re-attempting the hipBLASLt allocs via the BAR path -> 0xC000000D
+  // VRAM-alloc fail -> hang (#63). Fail fast instead.
+  if (closed_) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
   if (wddm_lite_state_ != nullptr && wddm_lite_state_->brought_up) {
     return HSA_STATUS_SUCCESS;
+  }
+  // #63: process-global guard. A late HIP call during torch/static-object
+  // destruction re-runs hsa_init -> Load -> a FRESH WindowsLiteDriver::Init ->
+  // here on a NEW object, re-opening the adapter + reloading GFX firmware on the
+  // live GPU -> wedge/VM-crash. If ANY driver in this process already brought the
+  // GPU up, refuse: it is already up and a fresh object must not re-init it. A new
+  // process (next test subprocess / hipDeviceReset) gets a fresh static.
+  static bool g_gpuBroughtUpInProcess = false;
+  static int g_refuseCount = 0;
+  if (g_gpuBroughtUpInProcess) {
+    std::fprintf(stderr, "ROCR #63 guard: REFUSED re-acquire count=%d\n", ++g_refuseCount);
+    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
   }
   if (wddm_lite_state_ == nullptr) {
     wddm_lite_state_ = std::make_unique<WddmLiteState>();
@@ -402,6 +419,7 @@ hsa_status_t WindowsLiteDriver::EnsureGpuBringUpLocked() {
   // base wddmAllocVram offsets are added to). Mirrors the Linux transport.
   framebuffer_base_ = s.ctx.vramMcBase;
   s.brought_up = true;
+  g_gpuBroughtUpInProcess = true;
   return HSA_STATUS_SUCCESS;
 }
 
@@ -550,6 +568,7 @@ hsa_status_t WindowsLiteDriver::Close() {
     wddm_lite_state_->gpu.close();
     wddm_lite_state_.reset();
   }
+  closed_ = true;
   return HSA_STATUS_SUCCESS;
 }
 
