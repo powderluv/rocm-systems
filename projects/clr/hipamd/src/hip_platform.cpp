@@ -17,6 +17,13 @@
 #include <limits>
 #include <cmath>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace hip_impl {
 // ================================================================================================
 hipError_t ihipOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -294,11 +301,40 @@ void __hipRegisterTexture(
 }
 
 // ================================================================================================
+// #63: On the lite:: backends the completion/wptr helper threads are terminated
+// by the OS loader (LdrShutdownProcess) before this process-exit onexit handler
+// runs, so a HostQueue::finish() drain here spin-waits forever on a marker that
+// can never be serviced (cdb stack: amd::Event::awaitCompletion in
+// HostQueue::finish, called from SyncAllStreams). The GPU context is destroyed
+// at process exit regardless, so the drain is unnecessary. Env-gated while under
+// validation.
+static bool skipShutdownStreamSync() {
+#ifdef _WIN32
+  // Default-on for the lite:: backends: skip the drain once the process is
+  // exiting. Opt-out escape hatch for debugging.
+  static const bool disabled =
+      (getenv("ROCR_LITE_NO_SHUTDOWN_STREAM_SYNC_SKIP") != nullptr);
+  if (disabled) return false;
+  typedef unsigned char(__stdcall * RtlDllShutdownInProgress_t)(void);
+  static RtlDllShutdownInProgress_t fn = []() -> RtlDllShutdownInProgress_t {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll ? reinterpret_cast<RtlDllShutdownInProgress_t>(
+                       GetProcAddress(ntdll, "RtlDllShutdownInProgress"))
+                 : nullptr;
+  }();
+  return fn && (fn() != 0);
+#else
+  return false;
+#endif
+}
+
+// ================================================================================================
 void __hipUnregisterFatBinary(void** modules) {
   auto* fat_binary_modules = reinterpret_cast<hip::FatBinaryInfo**>(modules);
   static std::once_flag unregister_device_sync;
   // If SKIP ABORT is set and GPU is in error, dont need to sync streams.
-  if (!HIP_SKIP_ABORT_ON_GPU_ERROR || !amd::Device::IsGPUInError()) {
+  if ((!HIP_SKIP_ABORT_ON_GPU_ERROR || !amd::Device::IsGPUInError()) &&
+      !skipShutdownStreamSync()) {
     std::call_once(unregister_device_sync, []() {
       for (const auto& hipDevice : g_devices) {
         // By synchronizing devices ensure that all HSA signal handlers
