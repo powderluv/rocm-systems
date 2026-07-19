@@ -2593,6 +2593,18 @@ hsa_status_t DestroyDirectQueue(const DirectQueuePlatform& platform,
       platform.SleepUs(1000);
     }
     platform.WriteMmio32(kGcBase0, regCP_HQD_DEQUEUE_REQUEST, 0);
+    // The firmware dequeue does not reliably clear the doorbell-enable bit
+    // (gfx12: "may not stick"), which would leave WaitForDirectHqdIdle's
+    // doorbell-off condition unmet -> timeout -> the queue is reported as not
+    // destroyed (the historical macOS flake that forced SKIP_DESTROY, which then
+    // leaks queues across processes). Clear it explicitly, mirroring the disable
+    // path below, so the destroy is deterministic rather than reliant on the
+    // dequeue happening to clear it.
+    uint32_t dequeue_doorbell_ctl = 0;
+    platform.ReadMmio32(kGcBase0, regCP_HQD_PQ_DOORBELL_CONTROL,
+                        &dequeue_doorbell_ctl);
+    platform.WriteMmio32(kGcBase0, regCP_HQD_PQ_DOORBELL_CONTROL,
+                         dequeue_doorbell_ctl & ~0x40000000u);
     status = WaitForDirectHqdIdle(platform, pipe, hqd_queue, "destroy", options);
     if (status != HSA_STATUS_SUCCESS) {
       DeselectHqd(platform);
