@@ -1692,6 +1692,44 @@ DirectQueueMqd BuildMesKernelQueueMqd(const DirectQueueLayout& layout,
   return scratch_done ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
 }
 
+// --- Per-process MES scheduler teardown (#66) -------------------------------
+// Windows has no KMD to reset queues on process exit and the driver's C++
+// teardown does not run on a hard exit, so a process that exits leaving its MES
+// scheduler-ring HQD (me=3/pipe=0) ACTIVE wedges the next process: the fresh
+// EnsureMesScheduler's dequeue-drain of that HQD times out on the now-dead ring
+// and the scheduler SET_HW_RESOURCES is never serviced (MES map status=4096 ->
+// hsa_queue_create fails from the 3rd process on). Deactivating THIS process's
+// scheduler HQD while the MES is still healthy (its drain completes at once)
+// leaves active=0 so the next process's reset is clean. Opt-in Windows-only via
+// ROCR_WINDOWS_MES_TEARDOWN_AT_EXIT so macOS/Linux and the default path are
+// byte-identical unless enabled.
+bool MesTeardownAtExitEnabled() {
+  const char* v = std::getenv("ROCR_WINDOWS_MES_TEARDOWN_AT_EXIT");
+  return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+void DeactivateMesSchedulerHqd(const DirectQueuePlatform& platform,
+                               MesSchedulerState& state) {
+  const uint32_t pipe = MesPipeForRing(state.ring);
+  if (SelectHqd(platform, kMesKiqMe, pipe, 0) != HSA_STATUS_SUCCESS) return;
+  DirectQueueOptions options;  // trace off, default dequeue timeout
+  // Reuse the exact reset the next process would run on this HQD, but now, while
+  // the MES is healthy: the drain completes immediately (active -> 0) instead of
+  // timing out on a dead ring, leaving a clean HQD for the next bring-up.
+  ResetSelectedHqdForProgramming(platform, pipe, 0, options, "TEARDOWN");
+  DeselectHqd(platform);
+}
+
+void TeardownAllMesSchedulersAtExit() {
+  std::lock_guard<std::mutex> lock(MesSchedulerMutex());
+  for (auto& entry : MesSchedulers()) {
+    MesSchedulerState& state = entry.second;
+    if (!state.initialized) continue;
+    DeactivateMesSchedulerHqd(*entry.first, state);
+    state.initialized = false;
+  }
+}
+
 hsa_status_t EnsureMesScheduler(const DirectQueuePlatform& platform,
                                 uint64_t framebuffer_base,
                                 const DirectQueueOptions& options) {
@@ -1957,6 +1995,13 @@ hsa_status_t EnsureMesScheduler(const DirectQueuePlatform& platform,
   InitMesAggregatedDoorbells(platform, state);
 
   state.initialized = true;
+  if (MesTeardownAtExitEnabled()) {
+    // Register once: on clean process exit, deactivate this process's MES
+    // scheduler HQD so the next process's bring-up is not wedged (#66).
+    static std::once_flag mes_teardown_once;
+    std::call_once(mes_teardown_once,
+                   [] { std::atexit(TeardownAllMesSchedulersAtExit); });
+  }
   if (options.trace) {
     uint32_t version = 0;
     platform.ReadMmio32(kGcBase1, regCP_MES_GP3_LO, &version);
