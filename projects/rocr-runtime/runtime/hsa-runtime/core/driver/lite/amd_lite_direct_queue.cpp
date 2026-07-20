@@ -1700,12 +1700,21 @@ DirectQueueMqd BuildMesKernelQueueMqd(const DirectQueueLayout& layout,
 // and the scheduler SET_HW_RESOURCES is never serviced (MES map status=4096 ->
 // hsa_queue_create fails from the 3rd process on). Deactivating THIS process's
 // scheduler HQD while the MES is still healthy (its drain completes at once)
-// leaves active=0 so the next process's reset is clean. Opt-in Windows-only via
-// ROCR_WINDOWS_MES_TEARDOWN_AT_EXIT so macOS/Linux and the default path are
-// byte-identical unless enabled.
+// leaves active=0 so the next process's reset is clean. Default ON on Windows
+// (opt out with ROCR_WINDOWS_MES_TEARDOWN_AT_EXIT=0); macOS/Linux stay opt-in so
+// their exit path is byte-identical unless the env is explicitly set.
 bool MesTeardownAtExitEnabled() {
   const char* v = std::getenv("ROCR_WINDOWS_MES_TEARDOWN_AT_EXIT");
+#ifdef _WIN32
+  // Default ON: without this, a 2nd process cannot bring up the GPU (#66). An
+  // explicit env value wins (set =0 to opt out).
+  if (v != nullptr && v[0] != '\0') return v[0] != '0';
+  return true;
+#else
+  // macOS/Linux: opt-in only (their per-process path differs; do not touch the
+  // exit behavior unless explicitly enabled).
   return v != nullptr && v[0] != '\0' && v[0] != '0';
+#endif
 }
 
 void DeactivateMesSchedulerHqd(const DirectQueuePlatform& platform,
