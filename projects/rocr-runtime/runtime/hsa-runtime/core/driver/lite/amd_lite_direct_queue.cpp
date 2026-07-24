@@ -1704,15 +1704,20 @@ DirectQueueMqd BuildMesKernelQueueMqd(const DirectQueueLayout& layout,
 // (opt out with ROCR_WINDOWS_MES_TEARDOWN_AT_EXIT=0); macOS/Linux stay opt-in so
 // their exit path is byte-identical unless the env is explicitly set.
 bool MesTeardownAtExitEnabled() {
-  const char* v = std::getenv("ROCR_WINDOWS_MES_TEARDOWN_AT_EXIT");
-#ifdef _WIN32
-  // Default ON: without this, a 2nd process cannot bring up the GPU (#66). An
-  // explicit env value wins (set =0 to opt out).
+  const char* v = std::getenv("ROCR_MACOS_MES_TEARDOWN_AT_EXIT");
+  if (v == nullptr) v = std::getenv("ROCR_WINDOWS_MES_TEARDOWN_AT_EXIT");
+#if defined(_WIN32) || defined(__APPLE__)
+  // Default ON (Windows + macOS): on the MES-backed path a prior process leaves
+  // the MES scheduler-ring HQD active, wedging the next process's scheduler
+  // SET_HW_RESOURCES (status=4096; Windows returns an error, macOS retries the
+  // create -> hang). HW-validated on both: macOS MES isolate 9/9 (was 0/9) +
+  // 5/5 sequential torch procs. An explicit env value wins (set =0 to opt out).
+  // No-op unless an MES scheduler was actually initialized (e.g. macOS default
+  // direct path never registers this).
   if (v != nullptr && v[0] != '\0') return v[0] != '0';
   return true;
 #else
-  // macOS/Linux: opt-in only (their per-process path differs; do not touch the
-  // exit behavior unless explicitly enabled).
+  // Linux: opt-in only.
   return v != nullptr && v[0] != '\0' && v[0] != '0';
 #endif
 }
