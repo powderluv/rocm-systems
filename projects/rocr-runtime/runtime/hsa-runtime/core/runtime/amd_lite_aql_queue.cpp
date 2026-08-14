@@ -48,6 +48,17 @@ constexpr uint32_t COMPUTE_PGM_LO = 0x2E0C;
 constexpr uint32_t COMPUTE_PGM_RSRC1 = 0x2E12;
 constexpr uint32_t COMPUTE_RESOURCE_LIMITS = 0x2E15;
 constexpr uint32_t COMPUTE_TMPRING_SIZE = 0x2E18;
+// gfx12 architected-flat-scratch dispatch base (regCOMPUTE_DISPATCH_SCRATCH_
+// BASE_LO/HI). Value = backing VA >> 8 (256-byte units).
+constexpr uint32_t COMPUTE_DISPATCH_SCRATCH_BASE_LO = 0x2E10;
+constexpr uint32_t COMPUTE_DISPATCH_SCRATCH_BASE_HI = 0x2E11;
+static_assert(COMPUTE_DISPATCH_SCRATCH_BASE_HI == COMPUTE_DISPATCH_SCRATCH_BASE_LO + 1,
+              "scratch base LO/HI must be consecutive SH registers");
+constexpr uint32_t kScratchGranularity = 256;
+constexpr uint32_t kGfx1201NumCu = 64;
+constexpr uint32_t kMaxSlotsScratchCU = 32;
+constexpr uint32_t kScratchMaxWaves = kGfx1201NumCu * kMaxSlotsScratchCU;
+constexpr uint32_t kScratchSeFactor = 4;
 constexpr uint32_t COMPUTE_RESTART_X = 0x2E1B;
 constexpr uint32_t COMPUTE_PGM_RSRC3_GFX12 = 0x2E28;
 constexpr uint32_t COMPUTE_USER_DATA_0 = 0x2E40;
@@ -65,6 +76,12 @@ constexpr uint16_t kPropDispatchId = 1u << 4;
 constexpr uint16_t kPropFlatScratchInit = 1u << 5;
 constexpr uint16_t kPropPrivateSegmentSize = 1u << 6;
 constexpr uint16_t kPropWave32 = 1u << 10;
+// Tensile assembly kernels (rocBLAS/hipBLASLt GEMM) leave the descriptor's
+// kernarg_size field at 0 though they consume a kernarg segment. The lite:: path
+// copies the host kernarg pool into GPU memory (unlike KFD, which passes the
+// pointer straight to the CP), so it needs a size; fall back to a bounded copy
+// that covers a GEMM's args (the kernel reads only what its ABI defines).
+constexpr uint32_t kFallbackKernargBytes = 512;
 
 uint64_t AlignUp(uint64_t value, uint64_t align) {
   return (value + align - 1) & ~(align - 1);
@@ -229,6 +246,7 @@ LiteAqlQueue::LiteAqlQueue(core::SharedQueue* shared_queue, LiteGpuAgent* agent,
 
 LiteAqlQueue::~LiteAqlQueue() {
   LiteAqlQueue::Inactivate();
+  if (gpu_scratch_cpu_) driver_.FreeMemory(gpu_scratch_cpu_, gpu_scratch_size_);
   if (scratch_cpu_) driver_.FreeMemory(scratch_cpu_, scratch_size_);
   if (marker_cpu_base_) driver_.FreeMemory(marker_cpu_base_, 4096);
   if (ring_buf_) core::Runtime::runtime_singleton_->system_deallocator()(ring_buf_);
@@ -353,6 +371,20 @@ hsa_status_t LiteAqlQueue::AllocateDispatchScratch(size_t size, size_t align, vo
   return HSA_STATUS_SUCCESS;
 }
 
+hsa_status_t LiteAqlQueue::EnsureGpuScratch(size_t size) {
+  if (size <= gpu_scratch_size_) return HSA_STATUS_SUCCESS;
+  const size_t rounded = static_cast<size_t>(AlignUp(size, 64 * 1024));
+  void* cpu = nullptr;
+  uint64_t gpu = 0;
+  hsa_status_t status = driver_.AllocateVram(rounded, 4096, &cpu, &gpu);
+  if (status != HSA_STATUS_SUCCESS) return status;
+  if (gpu_scratch_cpu_) driver_.FreeMemory(gpu_scratch_cpu_, gpu_scratch_size_);
+  gpu_scratch_cpu_ = cpu;
+  gpu_scratch_gpu_ = gpu;
+  gpu_scratch_size_ = rounded;
+  return HSA_STATUS_SUCCESS;
+}
+
 hsa_status_t LiteAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& packet) {
   using rocr::llvm::amdhsa::kernel_descriptor_t;
 
@@ -373,12 +405,17 @@ hsa_status_t LiteAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& pack
 
   uint64_t kernarg_gpu = 0;
   std::vector<std::pair<uint64_t, uint64_t>> kernarg_translations;
-  if (packet.kernarg_address != nullptr && kd->kernarg_size != 0) {
+  uint32_t kernarg_size = kd->kernarg_size;
+  if (kernarg_size == 0 && packet.kernarg_address != nullptr &&
+      (kd->kernel_code_properties & kPropKernargPtr) != 0) {
+    kernarg_size = kFallbackKernargBytes;  // Tensile GEMM: kd->kernarg_size==0
+  }
+  if (packet.kernarg_address != nullptr && kernarg_size != 0) {
     void* kernarg_cpu = nullptr;
-    status = AllocateDispatchScratch(kd->kernarg_size, 16, &kernarg_cpu, &kernarg_gpu);
+    status = AllocateDispatchScratch(kernarg_size, 16, &kernarg_cpu, &kernarg_gpu);
     if (status != HSA_STATUS_SUCCESS) return status;
 
-    std::vector<uint8_t> kernargs(kd->kernarg_size);
+    std::vector<uint8_t> kernargs(kernarg_size);
     std::memcpy(kernargs.data(), packet.kernarg_address, kernargs.size());
     for (size_t off = 0; off + sizeof(uint64_t) <= kernargs.size(); off += sizeof(uint64_t)) {
       uint64_t value = 0;
@@ -399,7 +436,7 @@ hsa_status_t LiteAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& pack
       std::fprintf(stderr,
                    "ROCR amdgpu_lite AQL kernargs host=%p gpu=0x%llx size=%u qwords=",
                    packet.kernarg_address, static_cast<unsigned long long>(kernarg_gpu),
-                   kd->kernarg_size);
+                   kernarg_size);
       for (size_t i = 0; i < qword_count; ++i) {
         uint64_t value = 0;
         std::memcpy(&value, kernargs.data() + i * sizeof(value), sizeof(value));
@@ -430,10 +467,56 @@ hsa_status_t LiteAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& pack
     CopyToBar(dispatch_packet_cpu, &gpu_packet, sizeof(gpu_packet));
   }
 
-  if ((kd->kernel_code_properties & kPropPrivateSegmentBuffer) != 0 ||
-      ((kd->kernel_code_properties & kPropFlatScratchInit) != 0 &&
-       packet.private_segment_size != 0)) {
+  // The enable_sgpr_private_segment_buffer (V# in user SGPRs) path is genuinely
+  // unimplemented and unused by gfx12 architected flat scratch; keep rejecting.
+  if ((kd->kernel_code_properties & kPropPrivateSegmentBuffer) != 0) {
     return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+  // gfx12 architected flat scratch (port of macOS #15 / Windows #57). A spilling
+  // kernel needs a private-segment backing + nonzero COMPUTE_TMPRING_SIZE +
+  // COMPUTE_DISPATCH_SCRATCH_BASE (per-dispatch below) + the MQD scratch state +
+  // per-VMID SH_MEM aperture that SetDirectComputeScratch programs. Opt out with
+  // ROCR_AMDGPU_LITE_AQL_DISABLE_SCRATCH.
+  const bool enable_scratch = !EnvEnabled("ROCR_AMDGPU_LITE_AQL_DISABLE_SCRATCH");
+  const uint32_t scratch_bytes_per_thread = std::max<uint32_t>(
+      packet.private_segment_size, kd->private_segment_fixed_size);
+  const bool wants_scratch = scratch_bytes_per_thread != 0;
+  if (wants_scratch && !enable_scratch) {
+    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+
+  uint64_t gpu_scratch_base_256 = 0;
+  uint32_t compute_tmpring_size = 0;
+  if (wants_scratch) {
+    const uint32_t lanes =
+        (kd->kernel_code_properties & kPropWave32) != 0 ? 32u : 64u;
+    const uint32_t bytes_per_thread = static_cast<uint32_t>(
+        AlignUp(scratch_bytes_per_thread, kScratchGranularity / lanes));
+    const uint32_t wave_bytes = bytes_per_thread * lanes;
+    const uint32_t wavesize_units = CeilDiv(wave_bytes, kScratchGranularity);
+    const uint64_t backing =
+        static_cast<uint64_t>(wave_bytes) * kScratchMaxWaves * kScratchSeFactor;
+    status = EnsureGpuScratch(static_cast<size_t>(backing));
+    if (status != HSA_STATUS_SUCCESS) return status;
+    gpu_scratch_base_256 = gpu_scratch_gpu_ >> 8;
+    compute_tmpring_size =
+        (kScratchMaxWaves & 0xFFFu) | ((wavesize_units & 0x3FFFFu) << 12);
+    if (TraceAql()) {
+      std::fprintf(stderr,
+                   "ROCR amdgpu_lite AQL scratch base=0x%llx pss=%u lanes=%u "
+                   "wave_bytes=%u wavesize=%u tmpring=0x%x backing=%zu\n",
+                   static_cast<unsigned long long>(gpu_scratch_gpu_),
+                   scratch_bytes_per_thread, lanes, wave_bytes, wavesize_units,
+                   compute_tmpring_size, gpu_scratch_size_);
+    }
+    if (gpu_scratch_base_256 != last_scratch_base_256_ ||
+        compute_tmpring_size != last_scratch_tmpring_) {
+      status = driver_.SetDirectComputeScratch(direct_queue_, gpu_scratch_base_256,
+                                               compute_tmpring_size);
+      if (status != HSA_STATUS_SUCCESS) return status;
+      last_scratch_base_256_ = gpu_scratch_base_256;
+      last_scratch_tmpring_ = compute_tmpring_size;
+    }
   }
 
   std::vector<uint32_t> user_data;
@@ -538,7 +621,11 @@ hsa_status_t LiteAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& pack
   SetShReg(pm4, COMPUTE_PGM_RSRC1,
            {kd->compute_pgm_rsrc1, kd->compute_pgm_rsrc2 | (lds_blocks << 15)});
   SetShReg(pm4, COMPUTE_PGM_RSRC3_GFX12, {compute_pgm_rsrc3});
-  SetShReg(pm4, COMPUTE_TMPRING_SIZE, {0});
+  if (gpu_scratch_base_256 != 0) {
+    SetShReg(pm4, COMPUTE_DISPATCH_SCRATCH_BASE_LO,
+             {Low32(gpu_scratch_base_256), High32(gpu_scratch_base_256)});
+  }
+  SetShReg(pm4, COMPUTE_TMPRING_SIZE, {compute_tmpring_size});
   SetShReg(pm4, COMPUTE_RESTART_X, {0, 0, 0});
   if (!user_data.empty()) SetShReg(pm4, COMPUTE_USER_DATA_0, user_data);
   if (!resource_skip) {
@@ -547,6 +634,9 @@ hsa_status_t LiteAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& pack
     } else {
       SetShReg(pm4, COMPUTE_RESOURCE_LIMITS,
                {0x3ff, 0xffffffff, 0xffffffff, 0, 0xffffffff, 0xffffffff});
+      // gfx12 interleaves TMPRING (0x2E18) inside the STATIC_THREAD_MGMT block;
+      // the contiguous 6-dword write zeroes it -> re-assert (macOS #15/Win #57).
+      SetShReg(pm4, COMPUTE_TMPRING_SIZE, {compute_tmpring_size});
     }
   }
   SetShReg(pm4, COMPUTE_START_X,

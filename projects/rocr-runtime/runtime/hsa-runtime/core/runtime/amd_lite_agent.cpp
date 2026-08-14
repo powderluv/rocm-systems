@@ -199,6 +199,8 @@ hsa_status_t LiteGpuAgent::DmaCopy(void* dst, const void* src, size_t size) {
   if (size != 0) {
     std::memcpy(dst, src, size);
     static_cast<LinuxAmdgpuLiteDriver&>(driver()).RegisterVramShadow(dst, size, src);
+    // H2D over the BAR needs an HDP flush before the GPU reads the data.
+    static_cast<LinuxAmdgpuLiteDriver&>(driver()).FlushHdp();
   }
   return HSA_STATUS_SUCCESS;
 }

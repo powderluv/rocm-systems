@@ -65,6 +65,10 @@ class LinuxAmdgpuLiteDriver final : public core::Driver {
                               void** mem, size_t size, uint32_t node_id) override;
   hsa_status_t FreeMemory(void* mem, size_t size) override;
 
+  // Flush the HDP so CPU writes to VRAM via the BAR reach DRAM and
+  // become visible to the GPU MC (H2D coherency; macOS #27 analog).
+  hsa_status_t FlushHdp() const { return transport_.FlushHdp(); }
+
   hsa_status_t CreateQueue(uint32_t node_id, HSA_QUEUE_TYPE type, uint32_t queue_pct,
                            HSA::hsa_amd_queue_priority_internal_t priority,
                            uint32_t sdma_engine_id, void* queue_addr,
@@ -142,6 +146,11 @@ class LinuxAmdgpuLiteDriver final : public core::Driver {
                                    size_t dword_count) const;
   hsa_status_t ReadDirectComputeRptr(const DirectComputeQueue& queue,
                                      uint32_t* rptr) const;
+  // Program the MQD scratch persistent-state + per-VMID SH_MEM aperture so a
+  // spilling kernel's FLAT_SCRATCH is initialized. scratch_base_256 = VA >> 8.
+  hsa_status_t SetDirectComputeScratch(DirectComputeQueue& queue,
+                                       uint64_t scratch_base_256,
+                                       uint32_t tmpring_size) const;
 
  private:
   struct VramAllocation {

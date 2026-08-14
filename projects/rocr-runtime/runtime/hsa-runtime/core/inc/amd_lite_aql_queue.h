@@ -79,6 +79,9 @@ class LiteAqlQueue : public core::Queue,
   hsa_status_t SubmitBarrier(const hsa_barrier_and_packet_t& packet, bool is_or);
   hsa_status_t SubmitPm4AndWait(const std::vector<uint32_t>& pm4);
   hsa_status_t AllocateDispatchScratch(size_t size, size_t align, void** cpu, uint64_t* gpu);
+  // gfx12 register-spill scratch backing (grow-only), distinct from the
+  // kernarg-staging bump buffer above.
+  hsa_status_t EnsureGpuScratch(size_t size);
   void CompleteSignal(hsa_signal_t signal, hsa_signal_value_t value);
   void ReportAsyncError(hsa_status_t status);
 
@@ -100,6 +103,13 @@ class LiteAqlQueue : public core::Queue,
   uint64_t scratch_gpu_ = 0;
   size_t scratch_size_ = 0;
   size_t scratch_offset_ = 0;
+
+  // Dedicated GPU private-segment (register spill) scratch, lazily grown.
+  void* gpu_scratch_cpu_ = nullptr;
+  uint64_t gpu_scratch_gpu_ = 0;
+  size_t gpu_scratch_size_ = 0;
+  uint64_t last_scratch_base_256_ = 0;
+  uint32_t last_scratch_tmpring_ = 0;
 
   static __forceinline int& rtti_id() {
     static int rtti_id_ = 0;

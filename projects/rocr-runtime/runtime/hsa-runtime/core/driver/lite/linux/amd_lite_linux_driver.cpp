@@ -410,6 +410,14 @@ hsa_status_t LinuxAmdgpuLiteDriver::ReadDirectComputeRptr(
   return lite::ReadDirectQueueRptr(transport_, queue, rptr);
 }
 
+hsa_status_t LinuxAmdgpuLiteDriver::SetDirectComputeScratch(
+    DirectComputeQueue& queue, uint64_t scratch_base_256,
+    uint32_t tmpring_size) const {
+  std::lock_guard<std::mutex> g(gpu_lock_);
+  return lite::SetDirectQueueScratch(transport_, queue, scratch_base_256,
+                                     tmpring_size, LinuxDirectQueueOptions());
+}
+
 hsa_status_t LinuxAmdgpuLiteDriver::CreateQueue(uint32_t, HSA_QUEUE_TYPE, uint32_t,
                                                 HSA::hsa_amd_queue_priority_internal_t,
                                                 uint32_t, void*, uint64_t,

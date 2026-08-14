@@ -1153,7 +1153,7 @@ construct_agent_cache(::HsaApiTable* table)
     ROCP_CI_LOG_IF(ERROR, hsa_agents.empty()) << fmt::format("Did not detect any HSA agents");
 
     auto rocp_hsa_agent_node_ids = std::set<uint32_t>{};
-    if(rocp_agents.size() != hsa_agents.size())
+    if(!rocp_agents.empty() && rocp_agents.size() != hsa_agents.size())
     {
         for(auto hitr : hsa_agents)
         {
@@ -1240,7 +1240,7 @@ construct_agent_cache(::HsaApiTable* table)
 
     ROCP_INFO << "# agent node maps: " << hsa_agent_node_map.size();
 
-    ROCP_FATAL_IF(agent_map.size() != hsa_agents.size())
+    ROCP_FATAL_IF(!rocp_agents.empty() && agent_map.size() != hsa_agents.size())
         << "rocprofiler was only able to map " << agent_map.size()
         << " rocprofiler agents to HSA agents, expected " << hsa_agents.size();
 

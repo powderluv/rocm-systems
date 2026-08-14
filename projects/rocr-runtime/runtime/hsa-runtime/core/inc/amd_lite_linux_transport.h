@@ -31,6 +31,7 @@ struct LinuxLiteBuffer {
 
 class LinuxAmdgpuLiteTransport final : public DirectQueuePlatform {
  public:
+  hsa_status_t FlushHdp() const override;
   explicit LinuxAmdgpuLiteTransport(std::string devnode = "/dev/amdgpu_lite0");
   ~LinuxAmdgpuLiteTransport() override;
 
@@ -63,7 +64,6 @@ class LinuxAmdgpuLiteTransport final : public DirectQueuePlatform {
                            uint32_t value) const override;
   hsa_status_t ZeroGpuMemory(uint64_t offset, uint64_t size) const override;
   hsa_status_t WriteGpuMemory32(uint64_t offset, uint32_t value) const override;
-  hsa_status_t FlushHdp() const override;
   void* GpuMemoryCpuPointer(uint64_t offset) const override;
   bool PreferAllocatedQueueMemory() const override { return true; }
   hsa_status_t AllocateQueueMemory(uint64_t size,

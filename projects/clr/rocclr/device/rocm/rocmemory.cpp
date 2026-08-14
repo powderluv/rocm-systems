@@ -6,6 +6,7 @@
 
 #if !defined(_WIN32)
 #include <unistd.h>
+#include <cstdlib>  // std::getenv (ROCR_AMDGPU_LITE_HOST_BLIT)
 #endif
 
 #include "CL/cl_ext.h"
@@ -880,6 +881,16 @@ bool Buffer::create(bool alloc_local) {
           // CPU-visible BAR window, so the same direct host blit applies.
           flags_ |= HostMemoryDirectAccess;
         }
+#else
+        // Linux amdgpu_lite maps device-local VRAM into the CPU-visible BAR
+        // window; its agent has no SDMA/GART reach into host memory, so the
+        // shader blit through host staging silently fails. Opt-in: route
+        // hipMemcpy H2D/D2H through the direct host<->BAR memcpy. Gated so the
+        // real KFD amdgpu path (non-CPU-derefable VRAM) is untouched.
+        if (deviceMemory_ != nullptr &&
+            std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT") != nullptr) {
+          flags_ |= HostMemoryDirectAccess;
+        }
 #endif
       }
       owner()->setSvmPtr(deviceMemory_);
@@ -992,6 +1003,11 @@ bool Buffer::create(bool alloc_local) {
       // The Windows WindowsLiteDriver likewise exposes device-local memory
       // through the CPU-visible BAR window.
       flags_ |= HostMemoryDirectAccess;
+#else
+      // Linux amdgpu_lite lite:: path (see above): opt-in direct host<->BAR memcpy.
+      if (std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT") != nullptr) {
+        flags_ |= HostMemoryDirectAccess;
+      }
 #endif
       const_cast<Device&>(dev()).updateFreeMemory(size(), false);
     }
