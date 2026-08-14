@@ -81,11 +81,28 @@ uint32_t DirectQueueDequeueSettleUs() {
   return static_cast<uint32_t>(parsed);
 }
 
+// Default-on env flag: unset -> on, "0" -> off. Used for the Linux direct-path
+// bring-up options that the doorbell-dead amdgpu_lite transport always needs.
+bool EnvOnByDefault(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') return true;
+  return std::strcmp(value, "0") != 0;
+}
+
 lite::DirectQueueOptions LinuxDirectQueueOptions() {
   lite::DirectQueueOptions options;
   options.force_reclaim = EnvEnabled("ROCR_AMDGPU_LITE_FORCE_DIRECT_COMPUTE");
   options.use_mes_queue = UseMesQueue();
+  // FORCE_DIRECT_COMPUTE selects the direct HQD path; never fall into the MES
+  // queue path, which blocks ~5s waiting on an MES ack that never arrives on the
+  // direct bring-up and then fails hsa_queue_create. Folds DISABLE_MES_QUEUE in so
+  // the direct path needs one flag, not two.
+  if (options.force_reclaim) options.use_mes_queue = false;
   options.use_firmware_dequeue = UseDirectQueueDequeue();
+  // Doorbell-dead amdgpu_lite transport: default the wptr-poll + MEC-doorbell
+  // bring-up on (env=0 disables). Folds DIRECT_WPTR_POLL / DIRECT_MEC_DOORBELL.
+  options.poll_wptr = EnvOnByDefault("ROCR_AMDGPU_LITE_DIRECT_WPTR_POLL");
+  options.mec_doorbell = EnvOnByDefault("ROCR_AMDGPU_LITE_DIRECT_MEC_DOORBELL");
   options.skip_destroy = SkipDirectQueueDestroy();
   options.trace = TraceDirectQueue();
   options.trace_verbose = TraceDirectQueueVerbose();

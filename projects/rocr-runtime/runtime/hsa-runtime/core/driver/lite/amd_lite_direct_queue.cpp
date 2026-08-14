@@ -2211,14 +2211,12 @@ uint32_t DirectQueuePipe(uint32_t queue_index) { return queue_index / 4; }
 
 uint32_t DirectQueueHqd(uint32_t queue_index) { return queue_index % 4; }
 
-uint32_t DirectQueueDoorbell(uint32_t queue_index) {
-  // Linux amdgpu_lite: kDirectComputeDoorbellBase (0x20) is an UNASSIGNED
-  // doorbell slot -> the CP never receives the ring (DOORBELL_HIT stays 0).
-  // The working Python direct HQD uses the MEC ring doorbell (0x6 + idx*2),
-  // whose NBIO routing the bring-up programs. Env-gated.
-  const char* mec_env = std::getenv("ROCR_AMDGPU_LITE_DIRECT_MEC_DOORBELL");
-  if (mec_env != nullptr && mec_env[0] != '\0' &&
-      std::strcmp(mec_env, "0") != 0) {
+uint32_t DirectQueueDoorbell(uint32_t queue_index, bool mec_doorbell) {
+  // Doorbell-dead amdgpu_lite transport (Linux): kDirectComputeDoorbellBase (0x20)
+  // is an UNASSIGNED doorbell slot -> the CP never receives the ring
+  // (DOORBELL_HIT stays 0). Use the MEC ring doorbell (0x6 + idx*2), whose NBIO
+  // routing the bring-up programs. macOS/Windows keep the 0x20 slot.
+  if (mec_doorbell) {
     return 0x6u + queue_index * 0x2u;
   }
   return kDirectComputeDoorbellBase + queue_index * kDirectComputeDoorbellStride;
@@ -2289,7 +2287,7 @@ hsa_status_t CreateDirectQueue(const DirectQueuePlatform& platform,
   *queue = {};
   queue->queue_index = queue_index;
   queue->queue_id = queue_index + 1;
-  queue->doorbell_index = DirectQueueDoorbell(queue_index);
+  queue->doorbell_index = DirectQueueDoorbell(queue_index, options.mec_doorbell);
   queue->ring_size_bytes = kDirectComputeRingSize;
   if (options.trace) {
     std::fprintf(stderr,
@@ -2477,9 +2475,7 @@ hsa_status_t CreateDirectQueue(const DirectQueuePlatform& platform,
   platform.WriteMmio32(kGcBase0, regCP_HQD_PQ_WPTR_POLL_ADDR_HI, mqd[0x8E]);
   platform.WriteMmio32(kGcBase0, regCP_HQD_PQ_DOORBELL_CONTROL, mqd[0x8F]);
   {
-    const char* dbell_en_env = std::getenv("ROCR_AMDGPU_LITE_DIRECT_WPTR_POLL");
-    if (dbell_en_env != nullptr && dbell_en_env[0] != '\0' &&
-        std::strcmp(dbell_en_env, "0") != 0) {
+    if (options.poll_wptr) {
       // Linux amdgpu_lite userspace doorbell is live (unlike Windows WDDM); the
       // working Python HQD runs with DOORBELL_EN set. Enable it so the doorbell
       // ring kicks the CP.
@@ -2497,9 +2493,7 @@ hsa_status_t CreateDirectQueue(const DirectQueuePlatform& platform,
     // but the C++ direct activation omits. The firmware dequeue leaves these
     // cleared -> the CP fetches+drains the ring but the dispatch launches NO
     // waves (spi=0, data=0). Match Python so waves launch. Env-gated.
-    const char* full_hqd_env = std::getenv("ROCR_AMDGPU_LITE_DIRECT_WPTR_POLL");
-    if (full_hqd_env != nullptr && full_hqd_env[0] != '\0' &&
-        std::strcmp(full_hqd_env, "0") != 0) {
+    if (options.poll_wptr) {
       platform.WriteMmio32(kGcBase0, 0x1FAEu, 0x2u);         // CP_HQD_PIPE_PRIORITY
       platform.WriteMmio32(kGcBase0, 0x1FAFu, 0xFu);         // CP_HQD_QUEUE_PRIORITY
       platform.WriteMmio32(kGcBase0, 0x1FB0u, 0x111u);       // CP_HQD_QUANTUM
@@ -2541,10 +2535,7 @@ hsa_status_t CreateDirectQueue(const DirectQueuePlatform& platform,
   // CP never polls the in-memory wptr the MMIO poke updates on the dead-doorbell
   // amdgpu_lite transport (cp=0). Env-gated so macOS's live doorbell is intact.
   {
-    const char* activate_poll_env =
-        std::getenv("ROCR_AMDGPU_LITE_DIRECT_WPTR_POLL");
-    if (activate_poll_env != nullptr && activate_poll_env[0] != '\0' &&
-        std::strcmp(activate_poll_env, "0") != 0) {
+    if (options.poll_wptr) {
       platform.WriteMmio32(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, 1u);
     }
   }
@@ -3041,9 +3032,7 @@ hsa_status_t SubmitDirectQueue(const DirectQueuePlatform& platform,
   // polling so the CP picks up the in-memory wptr, mirroring the mes_backed
   // submit. Gated (default off) so macOS's live-doorbell direct path is intact.
   {
-    const char* direct_poll_env = std::getenv("ROCR_AMDGPU_LITE_DIRECT_WPTR_POLL");
-    if (direct_poll_env != nullptr && direct_poll_env[0] != '\0' &&
-        std::strcmp(direct_poll_env, "0") != 0) {
+    if (options.poll_wptr) {
       platform.WriteMmio32(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, 1u);
     }
   }

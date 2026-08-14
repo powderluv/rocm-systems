@@ -78,6 +78,12 @@ struct DirectQueueOptions {
   bool force_reclaim = false;
   bool use_mes_queue = false;
   bool use_firmware_dequeue = true;
+  // Doorbell-dead amdgpu_lite transport (Linux): poll the in-memory wptr and use
+  // the routed MEC ring doorbell (0x6) instead of the unassigned 0x20 slot.
+  // Default false so macOS/Windows direct queues are unchanged; set by
+  // LinuxDirectQueueOptions.
+  bool poll_wptr = false;
+  bool mec_doorbell = false;
   bool skip_destroy = false;
   bool trace = false;
   bool trace_verbose = false;
@@ -116,7 +122,7 @@ class DirectQueuePlatform {
 
 uint32_t DirectQueuePipe(uint32_t queue_index);
 uint32_t DirectQueueHqd(uint32_t queue_index);
-uint32_t DirectQueueDoorbell(uint32_t queue_index);
+uint32_t DirectQueueDoorbell(uint32_t queue_index, bool mec_doorbell);
 
 DirectQueueLayout BuildDirectQueueLayout(uint64_t framebuffer_base,
                                          uint32_t queue_index);
