@@ -15,12 +15,16 @@
 #include <hip/amd_detail/hip_api_trace.hpp>
 #include "hrr/hip_capture.h"
 #include "profiler/hip_clr_profiler.hpp"
+#include <atomic>
+#include <cstdlib>
 namespace hip {
 const HipToolsDispatchTable* GetHipToolsDispatchTable();
 }  // namespace hip
 
 namespace hip {
 std::once_flag g_ihipInitialized;
+// Defined in hip_platform.cpp; set by the atexit registered in init() below.
+extern std::atomic<bool> g_processExiting;
 
 std::vector<hip::Device*> g_devices ROCCLR_INIT_PRIORITY(101);
 thread_local TlsAggregator tls;
@@ -30,6 +34,11 @@ amd::Context* host_context = nullptr;
 // init() is only to be called from the HIP_INIT macro only once
 void init(bool* status) {
   // Configure HIP runtime mode
+  // Register a process-exit flag so __hipUnregisterFatBinary can skip its
+  // exit-time stream drain on Linux (see hip_platform.cpp). init() is
+  // call_once'd on first HIP use -- after torch's fatbin static ctors -- so
+  // this atexit (LIFO) fires before torch's fatbin dtor.
+  std::atexit([]() { g_processExiting.store(true, std::memory_order_release); });
   amd::IS_HIP = true;
   GPU_NUM_MEM_DEPENDENCY = 0;
   // Initialize AMD runtime - critical for all subsequent operations

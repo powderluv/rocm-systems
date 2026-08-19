@@ -990,6 +990,16 @@ hsa_status_t Runtime::GetSignalEventId(hsa_signal_t signal, uint32_t* event_id) 
   return HSA_STATUS_SUCCESS;
 }
 
+// Set true by an atexit handler registered in Runtime::Load(). Once the process
+// begins exiting, a re-entrant hsa_amd_signal_async_handler (from a HIP fatbin or
+// stream teardown handler) must NOT allocate a new async-events pool block: the
+// agent kernarg region its system_allocator_ would use can already be freed by an
+// earlier exit handler while IS_OPEN() still reads true (a static-dtor-order race
+// between libhsa-runtime64 and libamdhip64), yielding a use-after-free SIGSEGV
+// (rc=-11). Registered at Load (first hsa_init, during compute) so by atexit LIFO
+// it fires before the HIP teardown handlers registered at library load.
+static std::atomic<bool> g_hsaProcessExiting{false};
+
 hsa_status_t Runtime::SetAsyncSignalHandler(hsa_signal_t signal, hsa_signal_condition_t cond,
                                             hsa_signal_value_t value,
                                             hsa_amd_signal_handler handler, void* arg) {
@@ -2292,19 +2302,30 @@ void Runtime::AsyncEventsPool::clear() {
 Runtime::AsyncEventItem* Runtime::AsyncEventsPool::alloc() {
   std::lock_guard<HybridMutex> lock(lock_);
   if (free_list_.empty()) {
-    AsyncEventItem* block = reinterpret_cast<AsyncEventItem*>(
-        allocate_()(block_size_ * sizeof(AsyncEventItem), __alignof(AsyncEventItem),
-                    core::MemoryRegion::AllocateNonPaged, 0));
+    // Once the process is exiting, the agent kernarg region that allocate_() (the
+    // Runtime::system_allocator_) uses may already be freed by an earlier exit
+    // handler while IS_OPEN() still reads true (a static-dtor-order race with
+    // libamdhip64). A re-entrant teardown async-handler registration must still
+    // succeed -- a HIP teardown drain waits on the callback, so skipping it hangs
+    // -- but must not touch that region (UAF SIGSEGV, rc=-11). Fall back to a
+    // plain host malloc; the block is intentionally leaked (process is exiting)
+    // and not tracked in block_list_ so clear() never region-frees it.
+    const bool exiting = g_hsaProcessExiting.load(std::memory_order_acquire);
+    auto alloc_block = [&](int n) -> AsyncEventItem* {
+      return reinterpret_cast<AsyncEventItem*>(
+          exiting ? malloc(n * sizeof(AsyncEventItem))
+                  : allocate_()(n * sizeof(AsyncEventItem), __alignof(AsyncEventItem),
+                                core::MemoryRegion::AllocateNonPaged, 0));
+    };
+    AsyncEventItem* block = alloc_block(block_size_);
     if (block == nullptr) {
       block_size_ = minblock_;
-      block = reinterpret_cast<AsyncEventItem*>(
-          allocate_()(block_size_ * sizeof(AsyncEventItem), __alignof(AsyncEventItem),
-                      core::MemoryRegion::AllocateNonPaged, 0));
+      block = alloc_block(block_size_);
       if (block == nullptr) throw std::bad_alloc();
     }
 
-    MAKE_NAMED_SCOPE_GUARD(throwGuard, [&]() { free_()(block); });
-    block_list_.push_back(std::make_pair(block, block_size_));
+    MAKE_NAMED_SCOPE_GUARD(throwGuard, [&]() { exiting ? free(block) : free_()(block); });
+    if (!exiting) block_list_.push_back(std::make_pair(block, block_size_));
     throwGuard.Dismiss();
 
     for (int i = 0; i < block_size_; i++) {
@@ -2727,6 +2748,17 @@ hsa_status_t Runtime::Load() {
   }
 
   flag_.Refresh();
+
+  // Register a process-exit flag so a re-entrant async-signal-handler during
+  // teardown can be skipped instead of touching a possibly-freed agent region
+  // (rc=-11 UAF). See g_hsaProcessExiting.
+  {
+    static std::once_flag exit_flag_once;
+    std::call_once(exit_flag_once, [] {
+      std::atexit([] { g_hsaProcessExiting.store(true, std::memory_order_release); });
+    });
+  }
+
   hotswap::ConfigureHotswapBackend();
 
   thunkLoader_ = new ThunkLoader();

@@ -17,6 +17,8 @@
 #include <mutex>
 #include <limits>
 #include <cmath>
+#include <atomic>
+#include <cstdlib>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -330,6 +332,10 @@ void __hipRegisterTexture(
 // HostQueue::finish, called from SyncAllStreams). The GPU context is destroyed
 // at process exit regardless, so the drain is unnecessary. Env-gated while under
 // validation.
+// Set true by an atexit handler registered in hip::init() so the exit-time
+// stream drain below can be skipped on Linux once the process is exiting.
+std::atomic<bool> g_processExiting{false};
+
 static bool skipShutdownStreamSync() {
 #ifdef _WIN32
   // Default-on for the lite:: backends: skip the drain once the process is
@@ -346,7 +352,16 @@ static bool skipShutdownStreamSync() {
   }();
   return fn && (fn() != 0);
 #else
-  return false;
+  // Linux analog of the Windows RtlDllShutdownInProgress gate: skip the
+  // exit-time drain once the process is exiting. The flag is set by an
+  // atexit handler registered in hip::init(); by __cxa_atexit LIFO it fires
+  // before torch's fatbin dtor, so it is set when __hipUnregisterFatBinary
+  // runs. This prevents the drain's SyncAllStreams -> hsa_amd_signal_async_
+  // handler re-entry into ROCr after teardown (rc=-11 SIGSEGV on lite::).
+  static const bool disabled =
+      (getenv("ROCR_LITE_NO_SHUTDOWN_STREAM_SYNC_SKIP") != nullptr);
+  if (disabled) return false;
+  return g_processExiting.load(std::memory_order_acquire);
 #endif
 }
 
