@@ -101,8 +101,11 @@ create_queue(hsa_agent_t        agent,
             return HSA_STATUS_SUCCESS;
         }
     }
-    ROCP_FATAL << "Could not find agent - " << agent.handle;
-    return HSA_STATUS_ERROR_FATAL;
+    // No rocprofiler agent for this queue (e.g. no KFD topology on the lite:: path):
+    // create the queue directly without profiling instead of aborting.
+    ROCP_WARNING << "Could not find agent - " << agent.handle << "; creating unprofiled queue";
+    return controller->get_core_table().hsa_queue_create_fn(
+        agent, size, type, callback, data, private_segment_size, group_segment_size, queue);
 }
 
 hsa_status_t

@@ -43,6 +43,8 @@
  *
  */
 #include <stdio.h>
+#include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -75,6 +77,11 @@
 #define COL_RESET "\033[0m"
 
 #define UNUSED(x) (void)(x)
+
+static bool EnvEnabled(const char* name) {
+  const char *value = getenv(name);
+  return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
 
 #define RET_IF_HSA_ERR(err) { \
   if ((err) != HSA_STATUS_SUCCESS) { \
@@ -1195,6 +1202,15 @@ AcquireAndDisplayAgentInfo(hsa_agent_t agent, void* data) {
   hsa_status_t err;
   agent_info_t agent_i;
 
+  if (EnvEnabled("ROCR_AMDGPU_LITE_ONLY")) {
+    hsa_device_type_t device_type;
+    err = hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type);
+    RET_IF_HSA_ERR(err);
+    if (device_type == HSA_DEVICE_TYPE_CPU) {
+      return HSA_STATUS_SUCCESS;
+    }
+  }
+
   int *agent_number = reinterpret_cast<int*>(data);
   (*agent_number)++;
 
@@ -1238,7 +1254,13 @@ AcquireAndDisplayAgentInfo(hsa_agent_t agent, void* data) {
 int CheckInitialState(void) {
 #ifdef _WIN32
   return 0;
+#elif defined(__APPLE__)
+  // Darwin uses the DriverKit MacOsDriver backend, not Linux ROCk/KFD.
+  return 0;
 #else
+  if (EnvEnabled("ROCR_AMDGPU_LITE_ONLY")) {
+    return 0;
+  }
   // Check kernel module for ROCk is loaded
 
   std::ifstream amdgpu_initstate("/sys/module/amdgpu/initstate");
@@ -1291,7 +1313,12 @@ int CheckInitialState(void) {
   bool member = false;
   struct passwd *pw;
   int num_groups = 0;
-  gid_t *groups;
+#ifdef __APPLE__
+  using group_list_entry_t = int;
+#else
+  using group_list_entry_t = gid_t;
+#endif
+  group_list_entry_t *groups;
 
   // Check if we can open /dev/kfd as read-write. If not, try to
   // diagnose common reasons why you can't.
@@ -1340,7 +1367,7 @@ int CheckInitialState(void) {
   }
 
   (void)getgrouplist(u_name, pw->pw_gid, NULL, &num_groups);
-  groups = new gid_t[num_groups];
+  groups = new group_list_entry_t[num_groups];
   if (getgrouplist(u_name, pw->pw_gid, groups, &num_groups) == -1) {
     printf("%sFailed to get user group list%s\n", COL_RED, COL_RESET);
     delete []groups;

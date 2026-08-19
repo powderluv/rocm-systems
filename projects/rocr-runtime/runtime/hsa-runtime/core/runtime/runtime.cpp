@@ -48,7 +48,11 @@
 #include <regex>
 #include <string>
 #if defined(__linux__)
+#if defined(__APPLE__)
+#include "core/inc/link_darwin.h"
+#else
 #include <link.h>
+#endif
 #include <dlfcn.h>
 #include <amdgpu_drm.h>
 #include <sys/mman.h>
@@ -250,7 +254,21 @@ void Runtime::RegisterAgent(Agent* agent, bool Enabled) {
     if (Enabled) {
       gpu_agents_.push_back(agent);
       gpu_ids_.push_back(agent->node_id());
+#if defined(__APPLE__)
+      // MacGpuAgent doesn't derive from AMD::GpuAgent (it extends
+      // GpuAgentInt directly). The static cast + KfdGpuID() call is
+      // Linux-KFD-specific; key agents_by_gpuid_ by node_id on Darwin
+      // until a cross-backend GpuID accessor exists.
+      agents_by_gpuid_[agent->node_id()] = agent;
+#elif defined(__linux__)
+      if (agent->driver().kernel_driver_type_ == DriverType::LINUX_AMDGPU_LITE) {
+        agents_by_gpuid_[agent->node_id()] = agent;
+      } else {
+        agents_by_gpuid_[((AMD::GpuAgent*)agent)->KfdGpuID()] = agent;
+      }
+#else
       agents_by_gpuid_[((AMD::GpuAgent*)agent)->KfdGpuID()] = agent;
+#endif
 
       // Assign the first discovered gpu agent as region gpu.
       if (region_gpu_ == NULL) region_gpu_ = agent;
@@ -867,9 +885,11 @@ hsa_status_t Runtime::GetSystemInfo(hsa_system_info_t attribute, void* value) {
         setFlag(HSA_EXTENSION_IMAGES);
       }
 
+#if !defined(__APPLE__)
       if (aqlprofile_lib_ != nullptr) {
         setFlag(HSA_EXTENSION_AMD_AQLPROFILE);
       }
+#endif
 
       setFlag(HSA_EXTENSION_AMD_PROFILER);
 
@@ -882,6 +902,16 @@ hsa_status_t Runtime::GetSystemInfo(hsa_system_info_t attribute, void* value) {
     case HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED: {
       bool ret = true;
       for (auto agent : gpu_agents_) {
+        if (
+#if defined(__APPLE__)
+            agent->driver().kernel_driver_type_ == DriverType::MACOS_DEXT ||
+#endif
+#if defined(__linux__)
+            agent->driver().kernel_driver_type_ == DriverType::LINUX_AMDGPU_LITE ||
+#endif
+            false) {
+          continue;
+        }
         AMD::GpuAgent* gpu = (AMD::GpuAgent*)agent;
         ret &= (gpu->properties().Capability.ui32.SVMAPISupported == 1);
       }
@@ -1021,9 +1051,16 @@ hsa_status_t Runtime::InteropMap(uint32_t num_agents, Agent** agents, hsa_handle
   const HSA_REGISTER_MEM_FLAGS reg_flags = {
       .ui32 = {.kmtHandle = ((flags & HSA_INTEROP_MAP_FLAG_KMT_HANDLE) != 0)}};
 
+#if defined(__APPLE__)
+  // hsaKmt graphics-handle registration is Linux KFD only. On Darwin no
+  // KFD-backed agent exists; InteropMap has no backend to target.
+  (void)reg_flags;
+  return HSA_STATUS_ERROR;
+#else
   auto status = HSAKMT_CALL(
       hsaKmtRegisterGraphicsHandleToNodesExt(resource_handle, &info, num_agents, nodes, reg_flags));
   if (status != HSAKMT_STATUS_SUCCESS) return HSA_STATUS_ERROR;
+#endif
 
   assert(num_agents > 0);
   auto& driver = agents[0]->driver();
@@ -1242,6 +1279,62 @@ hsa_status_t Runtime::PtrInfo(const void* ptr, hsa_amd_pointer_info_t* info, voi
         return HSA_STATUS_SUCCESS;
       }
     }
+
+#if defined(__APPLE__)
+    // Darwin has no KFD thunk to answer hsaKmtQueryPointerInfo. For allocations
+    // created through this runtime, the allocation map has enough information
+    // for ROCclr's access bookkeeping and pointer-attribute queries.
+    auto darwin_fragment = allocation_map_.upper_bound(ptr);
+    if (darwin_fragment != allocation_map_.begin()) {
+      --darwin_fragment;
+      const auto* base = reinterpret_cast<const uint8_t*>(darwin_fragment->first);
+      const auto* query = reinterpret_cast<const uint8_t*>(ptr);
+      if ((base <= query) && (query < base + darwin_fragment->second.size_requested)) {
+        const AMD::MemoryRegion* region =
+            reinterpret_cast<const AMD::MemoryRegion*>(darwin_fragment->second.region);
+        retInfo.type = HSA_EXT_POINTER_TYPE_HSA;
+        retInfo.agentBaseAddress = const_cast<void*>(darwin_fragment->first);
+        retInfo.hostBaseAddress = retInfo.agentBaseAddress;
+        retInfo.sizeInBytes = darwin_fragment->second.size_requested;
+        retInfo.registered = true;
+        retInfo.userData = darwin_fragment->second.user_ptr;
+        if (region != nullptr) {
+          uint32_t global_flags = 0;
+          if (region->GetPoolInfo(HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &global_flags) ==
+              HSA_STATUS_SUCCESS) {
+            retInfo.global_flags = global_flags;
+          }
+          retInfo.agentOwner = region->owner()->public_handle();
+          if (block_info != nullptr) {
+            block_info->base = retInfo.hostBaseAddress;
+            block_info->length = darwin_fragment->second.size_requested;
+            block_info->agentOwner = region->owner();
+          }
+        }
+        memcpy(info, &retInfo, retInfo.size);
+        if (returnListData) {
+          if (region != nullptr) {
+            *num_agents_accessible = 1;
+            *accessible = static_cast<hsa_agent_t*>(alloc(sizeof(hsa_agent_t)));
+            if (*accessible == nullptr) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            (*accessible)[0] = region->owner()->public_handle();
+          } else {
+            *num_agents_accessible = 0;
+            *accessible = nullptr;
+          }
+        }
+        return HSA_STATUS_SUCCESS;
+      }
+    }
+
+    retInfo.type = HSA_EXT_POINTER_TYPE_UNKNOWN;
+    memcpy(info, &retInfo, retInfo.size);
+    if (returnListData) {
+      *num_agents_accessible = 0;
+      *accessible = nullptr;
+    }
+    return HSA_STATUS_SUCCESS;
+#endif
 
     // We don't care if this returns an error code.
     // The type will be HSA_EXT_POINTER_TYPE_UNKNOWN if so.
@@ -1731,7 +1824,7 @@ hsa_status_t Runtime::IPCAttach(const hsa_amd_ipc_memory_t* handle, size_t len, 
   auto fixFragment = [&](HsaMemoryObjectHandle new_thunk_bo, HSAuint32 node_id = -1) {
     if (isFragment) {
       importAddress = reinterpret_cast<uint8_t*>(importAddress) + fragOffset;
-      len = Min(len, importSize - fragOffset);
+      len = Min(len, static_cast<size_t>(importSize - fragOffset));
     }
     std::lock_guard<std::shared_mutex> lock(memory_lock_);
     auto [it, inserted] = allocation_map_.try_emplace(importAddress, nullptr, len, len,

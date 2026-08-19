@@ -595,6 +595,15 @@ class Runtime {
 #if defined(HSAKMT_VIRTIO_ENABLED) && defined(__linux__)
         || driver_type == core::DriverType::KFD_VIRTIO
 #endif
+#if defined(__linux__)
+        || driver_type == core::DriverType::LINUX_AMDGPU_LITE
+#endif
+#if defined(__APPLE__)
+        || driver_type == core::DriverType::MACOS_DEXT
+#endif
+#if defined(_WIN32)
+        || driver_type == core::DriverType::WINDOWS_WDDM_LITE
+#endif
         ;
   }
 

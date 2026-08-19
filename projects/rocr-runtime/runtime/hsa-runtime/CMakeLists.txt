@@ -85,12 +85,38 @@ if (ROCM_CCACHE_BUILD)
   endif() # if (CCACHE_PROGRAM)
 endif() # if (ROCM_CCACHE_BUILD)
 
+# WIN32-OCLELF-SCAFFOLD: build in-tree oclelf as the libelf provider on Windows,
+# and alias it as elf::elf so the find_package(LibElf) block below is skipped.
+if(WIN32 AND DEFINED AMD_LIBELF_PATH AND NOT TARGET oclelf)
+  add_subdirectory(${AMD_LIBELF_PATH} ${CMAKE_BINARY_DIR}/oclelf_build)
+  # libelf.h pulls <sys/queue.h>/<elfdefinitions.h>; propagate the libelf + win32
+  # compat dirs so ROCr TUs that include libelf.h compile (oclelf keeps them PRIVATE).
+  target_include_directories(oclelf INTERFACE
+    ${AMD_LIBELF_PATH} ${AMD_LIBELF_PATH}/../common ${AMD_LIBELF_PATH}/../common/win32)
+endif()
+if(WIN32 AND TARGET oclelf AND NOT TARGET elf::elf)
+  add_library(elf::elf ALIAS oclelf)
+endif()
+
+# WIN32-HSAKMT-SCAFFOLD: the superbuild normally provides hsakmt::hsakmt via
+# add_subdirectory; in the standalone Windows build libhsakmt is built/installed
+# separately, so import the prebuilt static lib as that target.
+if(WIN32 AND DEFINED HSAKMT_LIB AND NOT TARGET hsakmt::hsakmt)
+  add_library(hsakmt::hsakmt STATIC IMPORTED)
+  set_target_properties(hsakmt::hsakmt PROPERTIES
+    IMPORTED_LOCATION "${HSAKMT_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${HSAKMT_INC};${HSAKMT_INC}/hsakmt"
+    INTERFACE_LINK_LIBRARIES "${WKMI_LIB}")
+endif()
+
 ## Find external dependencies.
 find_package(PkgConfig)
 
-find_package(LibElf CONFIG)
-if(NOT LibElf_FOUND)
-  find_package(LibElf REQUIRED)
+if(NOT TARGET elf::elf)
+  find_package(LibElf CONFIG)
+  if(NOT LibElf_FOUND)
+    find_package(LibElf REQUIRED)
+  endif()
 endif()
 
 ## Find AMD CUID library.
@@ -124,8 +150,12 @@ if(MSVC)
   endif()
 endif()
 
-if (UNIX)
+if (UNIX AND NOT APPLE)
   pkg_check_modules(drm REQUIRED IMPORTED_TARGET libdrm)
+elseif (APPLE)
+  # No libdrm on Darwin — KFD path is out of scope for the macOS port.
+  # The MacOsDriver backend (separate commit) takes DEXT/IOKit path.
+  target_include_directories(${CORE_RUNTIME_TARGET} PRIVATE ${LIBELF_INCLUDE_DIRS})
 else()
   target_include_directories(${CORE_RUNTIME_TARGET} PRIVATE ${LIBELF_INCLUDE_DIR})
   if (${BUILD_SHARED_LIBS})
@@ -137,8 +167,17 @@ set_property(TARGET  ${CORE_RUNTIME_TARGET} PROPERTY OUTPUT_NAME ${CORE_RUNTIME_
 
 ## Compiler preproc definitions.
 if (UNIX)
-  target_compile_definitions(${CORE_RUNTIME_TARGET} PRIVATE "${HSA_COMMON_DEFS}" __linux__ HSA_EXPORT=1 HSA_EXPORT_FINALIZER=1 HSA_EXPORT_IMAGES=1 HSA_DEPRECATED=
-  ROCR_BUILD_ID="${PACKAGE_VERSION_STRING}-${VERSION_JOB}-${VERSION_HASH}" )
+  # The __linux__ macro is compiler-built-in on Linux only. Darwin's compiler
+  # already defines __APPLE__ and must NOT have __linux__ injected — a lot of
+  # source files gate on #ifdef __linux__ and would wrongly take the Linux
+  # path otherwise.
+  if (APPLE)
+    target_compile_definitions(${CORE_RUNTIME_TARGET} PRIVATE "${HSA_COMMON_DEFS}" HSA_EXPORT=1 HSA_EXPORT_FINALIZER=1 HSA_EXPORT_IMAGES=1 HSA_DEPRECATED=
+    ROCR_BUILD_ID="${PACKAGE_VERSION_STRING}-${VERSION_JOB}-${VERSION_HASH}" )
+  else()
+    target_compile_definitions(${CORE_RUNTIME_TARGET} PRIVATE "${HSA_COMMON_DEFS}" __linux__ HSA_EXPORT=1 HSA_EXPORT_FINALIZER=1 HSA_EXPORT_IMAGES=1 HSA_DEPRECATED=
+    ROCR_BUILD_ID="${PACKAGE_VERSION_STRING}-${VERSION_JOB}-${VERSION_HASH}" )
+  endif()
 
   ## Check for memfd_create syscall
   include(CheckSymbolExists)
@@ -174,6 +213,17 @@ target_include_directories( ${CORE_RUNTIME_TARGET}
   ${CMAKE_CURRENT_BINARY_DIR}/core/runtime/trap_handler
   ${CMAKE_CURRENT_BINARY_DIR}/core/runtime/blit_shaders)
 
+## On Darwin we skip building libhsakmt (Linux /dev/kfd ioctl wrapper), but
+## the hsakmt ABI headers — pure user-space struct/enum declarations — are
+## still needed because core/inc/{runtime.h,queue.h,amd_gpu_agent.h} use
+## HSAKMT_STATUS / HsaEvent / etc. types in their public interface. Add the
+## in-tree header path so those includes resolve without pulling in the
+## library itself.
+if (APPLE)
+  target_include_directories( ${CORE_RUNTIME_TARGET} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../libhsakmt/include )
+endif()
+
 
 ## ------------------------- Linux Compiler and Linker options -------------------------
 if (UNIX)
@@ -205,10 +255,16 @@ if ( UNDEFINED_SANITIZER OR THEROCK_SANITIZER STREQUAL "UBSAN" OR DEFINED ENV{UN
   message(STATUS "hsa-runtime64: UndefinedBehaviorSanitizer (UBSAN) enabled")
 endif()
 
-if (UNIX)
+if (UNIX AND NOT APPLE)
   set ( LNKSCR "hsacore.so.link" )
   set ( DRVDEF "${CMAKE_CURRENT_SOURCE_DIR}/hsacore.so.def" )
   set(HSA_SHARED_LINK_FLAGS "-Wl,-Bdynamic -Wl,-z,noexecstack -Wl,${CMAKE_CURRENT_SOURCE_DIR}/${LNKSCR} -Wl,--version-script=${DRVDEF} -Wl,--enable-new-dtags ${HSA_SHARED_LINK_FLAGS}")
+elseif (APPLE)
+  # Darwin's ld64 doesn't accept -Bdynamic, -z options, --version-script,
+  # or --enable-new-dtags. Symbol visibility is handled by the per-symbol
+  # HSA_API annotations + -fvisibility=hidden already set in HSA_CXX_FLAGS.
+  # No link script equivalent; skip.
+  set(HSA_SHARED_LINK_FLAGS "")
 else()
   target_sources(${CORE_RUNTIME_TARGET} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/hsacore.dll.def")
 endif()
@@ -219,8 +275,48 @@ set_property(TARGET ${CORE_RUNTIME_TARGET} PROPERTY LINK_FLAGS ${HSA_SHARED_LINK
 ##  -------------------------  End Compiler and Linker options ----------------------------
 
 ## Source files.
-set ( SRCS core/driver/driver.cpp
-           core/driver/kfd/amd_kfd_driver.cpp
+if (APPLE)
+  # KFD driver backend is Linux /dev/kfd only; exclude from Darwin.
+  # MacOsDriver is our DriverKit/IOKit-based backend talking through
+  # libmacgpu; MacGpuAgent is the matching GPU agent skeleton (not yet
+  # wired into DiscoverGpu, since ISA registry + memory regions need
+  # more plumbing first — tracked as follow-up).
+  set ( SRCS core/driver/driver.cpp
+             core/driver/lite/amd_lite_direct_queue.cpp
+             core/driver/macos/amd_macos_driver.cpp
+             core/runtime/amd_macos_aql_queue.cpp
+             core/runtime/amd_macos_agent.cpp )
+else()
+  set ( SRCS core/driver/driver.cpp
+             core/driver/kfd/amd_kfd_driver.cpp
+             core/driver/lite/amd_lite_direct_queue.cpp )
+  if (UNIX AND NOT APPLE)
+    list(APPEND SRCS
+                core/driver/lite/linux/amd_lite_linux_driver.cpp
+                core/driver/lite/linux/amd_lite_linux_transport.cpp
+                core/runtime/amd_lite_aql_queue.cpp
+                core/runtime/amd_lite_agent.cpp)
+  elseif (WIN32)
+    # Windows lite:: backend over the amdgpu_mcdm WDDM KMD (D3DKMTEscape).
+    # WDDM_LITE_DIR must point to the wddm_lite source tree (wddm_lite.h,
+    # wddm_lite.cpp, gpu_init.cpp).  The standalone test harness
+    # (lite_direct_queue_test.cpp / wddm_lite_test.cpp) is NOT added here.
+    set(WDDM_LITE_DIR "" CACHE PATH "Path to wddm_lite (wddm_lite.h/wddm_lite.cpp/gpu_init.cpp)")
+    if(NOT WDDM_LITE_DIR)
+      message(FATAL_ERROR "WIN32 ROCr build requires -DWDDM_LITE_DIR=<path to wddm_lite dir>")
+    endif()
+    list(APPEND SRCS
+                core/driver/lite/windows/amd_windows_lite_driver.cpp
+                core/runtime/amd_windows_agent.cpp
+                core/runtime/amd_windows_aql_queue.cpp
+                ${WDDM_LITE_DIR}/wddm_lite.cpp
+                ${WDDM_LITE_DIR}/gpu_init.cpp
+                # PcsRuntime is referenced unconditionally by amd_gpu_agent/
+                # amd_aql_queue/runtime; compile it even with PC sampling off.
+                pcs/pcs_runtime.cpp)
+  endif()
+endif()
+list(APPEND SRCS
            core/util/small_heap.cpp
            core/util/timer.cpp
            core/util/flag.cpp
@@ -264,11 +360,19 @@ set ( SRCS core/driver/driver.cpp
            libamdhsacode/amd_hsa_code.cpp)
 
 if(UNIX)
-  set(SRC_OS core/util/lnx/os_linux.cpp
-	     libamdhsacode/lnx/amd_core_dump.cpp)
-  set(SRC_XDNA core/driver/xdna/amd_xdna_driver.cpp
-               core/runtime/amd_aie_agent.cpp
-               core/runtime/amd_aie_aql_queue.cpp)
+  if(APPLE)
+    set(SRC_OS core/util/darwin/os_darwin.cpp
+               libamdhsacode/darwin/amd_core_dump.cpp)
+    # XDNA (AMD NPU) is Linux-only: depends on /dev/accel/accel* and
+    # drm uapi that don't exist on Darwin. Skip on macOS.
+    set(SRC_XDNA )
+  else()
+    set(SRC_OS core/util/lnx/os_linux.cpp
+               libamdhsacode/lnx/amd_core_dump.cpp)
+    set(SRC_XDNA core/driver/xdna/amd_xdna_driver.cpp
+                 core/runtime/amd_aie_agent.cpp
+                 core/runtime/amd_aie_aql_queue.cpp)
+  endif()
 else()
   target_compile_definitions(${CORE_RUNTIME_TARGET} PRIVATE NOMINMAX)
   set(SRC_OS core/util/win/os_win.cpp
@@ -282,13 +386,77 @@ endif()
 
 target_sources( ${CORE_RUNTIME_TARGET} PRIVATE ${SRCS} ${SRC_OS} ${SRC_XDNA} )
 
+## WIN32: amd_windows_lite_driver.cpp does #include "wddm_lite.h" so WDDM_LITE_DIR
+## must be on the include path. Only set when WDDM_LITE_DIR was required above.
+if (WIN32 AND WDDM_LITE_DIR)
+  target_include_directories(${CORE_RUNTIME_TARGET} PRIVATE ${WDDM_LITE_DIR})
+endif()
+
 ## Depend on trap handler target.
-add_subdirectory( ${CMAKE_CURRENT_SOURCE_DIR}/core/runtime/trap_handler )
-add_dependencies( ${CORE_RUNTIME_TARGET} amd_trap_handler_v2 )
+if (APPLE OR WIN32)
+  # Darwin has no installed amdgpu-targeting clang / llvm-objcopy, so the
+  # trap-handler and blit-shader GPU asm builds can't run. Emit stub header
+  # files with empty byte arrays so amd_gpu_agent.cpp compiles; when a
+  # Darwin GPU backend is wired up later it can replace these with real
+  # pre-built blobs. Runtime use-sites check array size, so zero-length
+  # arrays just disable the trap feature — enough for bring-up.
+  set(TRAP_STUB_DIR ${CMAKE_CURRENT_BINARY_DIR}/core/runtime/trap_handler)
+  file(MAKE_DIRECTORY ${TRAP_STUB_DIR})
+  file(WRITE ${TRAP_STUB_DIR}/amd_trap_handler_v2.h
+"// Auto-generated Darwin stub — see CMakeLists.txt APPLE branch.\n\
+namespace rocr {\n\
+namespace AMD {\n\
+static const unsigned char kCodeTrapHandlerV2_9[1] = {0};\n\
+static const unsigned char kCodeTrapHandlerV2_942[1] = {0};\n\
+static const unsigned char kCodeTrapHandlerV2_1010[1] = {0};\n\
+static const unsigned char kCodeTrapHandlerV2_10[1] = {0};\n\
+static const unsigned char kCodeTrapHandlerV2_11[1] = {0};\n\
+static const unsigned char kCodeTrapHandlerV2_12[1] = {0};\n\
+static const unsigned char kCodeTrapHandlerV2_1250[1] = {0};\n\
+}  // namespace AMD\n\
+}  // namespace rocr\n\
+")
+else()
+  add_subdirectory( ${CMAKE_CURRENT_SOURCE_DIR}/core/runtime/trap_handler )
+  add_dependencies( ${CORE_RUNTIME_TARGET} amd_trap_handler_v2 )
+endif()
 
 ## Depend on blit shader target.
-add_subdirectory( ${CMAKE_CURRENT_SOURCE_DIR}/core/runtime/blit_shaders )
-add_dependencies( ${CORE_RUNTIME_TARGET} amd_blit_shaders_v2)
+if (APPLE OR WIN32)
+  # Same rationale as trap_handler — stub out the generated blit_shaders
+  # header. Consumer: core/runtime/amd_blit_kernel.cpp references the
+  # kCodeBlitKernel* arrays. Emit zero-length arrays; the MacOsDriver path
+  # uses DEXT-side SDMA/MEC ring copies rather than these GPU-side shaders.
+  set(BLIT_STUB_DIR ${CMAKE_CURRENT_BINARY_DIR}/core/runtime/blit_shaders)
+  file(MAKE_DIRECTORY ${BLIT_STUB_DIR})
+  file(WRITE ${BLIT_STUB_DIR}/amd_blit_shaders_v2.h
+"// Auto-generated Darwin stub — see CMakeLists.txt APPLE branch.\n\
+// Matches v2 symbols referenced by amd_gpu_agent.cpp (gfx7/gfx8 come from the\n\
+// checked-in amd_blit_shaders.h): kCode{CopyAligned,CopyMisaligned,Fill}{9,10,11,12,1250}.\n\
+namespace rocr {\n\
+namespace AMD {\n\
+static const unsigned char kCodeCopyAligned9[1] = {0};\n\
+static const unsigned char kCodeCopyAligned10[1] = {0};\n\
+static const unsigned char kCodeCopyAligned11[1] = {0};\n\
+static const unsigned char kCodeCopyAligned12[1] = {0};\n\
+static const unsigned char kCodeCopyAligned1250[1] = {0};\n\
+static const unsigned char kCodeCopyMisaligned9[1] = {0};\n\
+static const unsigned char kCodeCopyMisaligned10[1] = {0};\n\
+static const unsigned char kCodeCopyMisaligned11[1] = {0};\n\
+static const unsigned char kCodeCopyMisaligned12[1] = {0};\n\
+static const unsigned char kCodeCopyMisaligned1250[1] = {0};\n\
+static const unsigned char kCodeFill9[1] = {0};\n\
+static const unsigned char kCodeFill10[1] = {0};\n\
+static const unsigned char kCodeFill11[1] = {0};\n\
+static const unsigned char kCodeFill12[1] = {0};\n\
+static const unsigned char kCodeFill1250[1] = {0};\n\
+}  // namespace AMD\n\
+}  // namespace rocr\n\
+")
+else()
+  add_subdirectory( ${CMAKE_CURRENT_SOURCE_DIR}/core/runtime/blit_shaders )
+  add_dependencies( ${CORE_RUNTIME_TARGET} amd_blit_shaders_v2)
+endif()
 
 option(PC_SAMPLING_SUPPORT "Enable PC Sampling Support" ON)
 
@@ -382,19 +550,25 @@ if(${IMAGE_SUPPORT})
 
 endif()
 
-if (UNIX)
+if (UNIX AND NOT APPLE)
   target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE elf::elf dl pthread rt )
+elseif (APPLE)
+  # Darwin has no librt; clock_gettime and friends live in libc.
+  target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE elf::elf dl pthread )
 else()
   target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE Ws2_32 )
   target_link_directories(${CORE_RUNTIME_TARGET} PRIVATE ${DXCORE_LIB_PATH})
   target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE dxcore)
+  # D3DKMT (D3DKMTOpenAdapterFromDeviceName / D3DKMTEscape) for the
+  # amdgpu_mcdm WDDM lite:: backend lives in gdi32.
+  target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE gdi32)
 endif()
 
 # For static package rocprofiler-register dependency is not required
 # Link to hsakmt target for shared library builds
 # Link to hsakmt-staticdrm target for static library builds
 if( BUILD_SHARED_LIBS )
-  if (UNIX)
+  if (UNIX AND NOT APPLE)
     target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE hsakmt::hsakmt PkgConfig::drm)
     if( BUILD_THUNK_VIRTIO )
       message(STATUS "Building with virtio support")
@@ -411,13 +585,22 @@ if( BUILD_SHARED_LIBS )
     else()
       set(HSA_DEP_ROCPROFILER_REGISTER OFF CACHE INTERNAL "")
     endif() # end rocprofiler-register_FOUND
+  elseif (APPLE)
+    # No hsakmt or libdrm on Darwin. MacOsDriver goes through libmacgpu
+    # (userspace IOKit/DEXT shim) instead, built as a static library in the
+    # parent libmacgpu subdirectory and linked PRIVATE here so its symbols
+    # end up in libhsa-runtime64.dylib.
+    target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE macgpu)
+    set(HSA_DEP_ROCPROFILER_REGISTER OFF CACHE INTERNAL "")
   else()
     target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE hsakmt::hsakmt)
   endif()
 else()
-  if (UNIX)
+  if (UNIX AND NOT APPLE)
     include_directories(${drm_INCLUDE_DIRS})
     target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE hsakmt-staticdrm::hsakmt-staticdrm)
+  elseif (APPLE)
+    # Static build on Darwin: no hsakmt/libdrm to link against.
   else()
     target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE hsakmt-staticdrm::hsakmt-staticdrm)
   endif()
@@ -436,9 +619,14 @@ if( NOT ${BUILD_SHARED_LIBS} )
 
   ## Bind to source build target interface but not its link requirements.
   target_include_directories( ${CORE_RUNTIME_NAME} INTERFACE $<TARGET_PROPERTY:${CORE_RUNTIME_NAME}::${CORE_RUNTIME_TARGET},INTERFACE_INCLUDE_DIRECTORIES> )
-  if (UNIX)
+  if (UNIX AND NOT APPLE)
     target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE -Wl,$<INSTALL_PREFIX>/${CMAKE_INSTALL_LIBDIR}/cmake/${CORE_RUNTIME_NAME}/${LNKSCR}
       -Wl,--whole-archive $<TARGET_FILE:${CORE_RUNTIME_NAME}::${CORE_RUNTIME_TARGET}> -Wl,--no-whole-archive)
+  elseif (APPLE)
+    # Darwin's ld64 has no --whole-archive; use -Wl,-force_load on the
+    # full archive path instead.
+    target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE
+      -Wl,-force_load,$<TARGET_FILE:${CORE_RUNTIME_NAME}::${CORE_RUNTIME_TARGET}>)
   else()
     # Windows: Link the static library directly without linker script
     target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE ${CORE_RUNTIME_TARGET})
@@ -446,10 +634,15 @@ if( NOT ${BUILD_SHARED_LIBS} )
   add_dependencies( ${CORE_RUNTIME_NAME} ${CORE_RUNTIME_TARGET} )
 
   ## Add external link requirements.
-  target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE hsakmt-staticdrm::hsakmt-staticdrm )
-  if (UNIX)
+  if (UNIX AND NOT APPLE)
+    target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE hsakmt-staticdrm::hsakmt-staticdrm )
     target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE elf::elf dl pthread rt )
+  elseif (APPLE)
+    # No hsakmt/libdrm on Darwin. librt doesn't exist (clock_gettime is in
+    # libc). dl + pthread are in libSystem, but we still pass them for parity.
+    target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE elf::elf dl pthread )
   else()
+    target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE hsakmt-staticdrm::hsakmt-staticdrm )
     target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE Ws2_32 )
   endif()
   install ( TARGETS ${CORE_RUNTIME_NAME} EXPORT ${CORE_RUNTIME_NAME}Targets )

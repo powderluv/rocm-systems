@@ -6,6 +6,7 @@
 
 #if !defined(_WIN32)
 #include <unistd.h>
+#include <cstdlib>  // std::getenv (ROCR_AMDGPU_LITE_HOST_BLIT)
 #endif
 
 #include "CL/cl_ext.h"
@@ -1000,6 +1001,25 @@ bool Buffer::create(bool alloc_local) {
         flags.contiguous_ = (memFlags & ROCCLR_MEM_HSA_CONTIGUOUS) != 0;
         flags.uncached_ = (memFlags & ROCCLR_MEM_HSA_UNCACHED) != 0;
         deviceMemory_ = dev().deviceLocalAlloc(size(), flags);
+#if defined(__APPLE__) || defined(_WIN32)
+        if (deviceMemory_ != nullptr) {
+          // Darwin's MVP device-local allocation is backed by CPU-visible
+          // memory, so host blits must not recurse through an indirect map.
+          // The Windows WindowsLiteDriver maps device-local VRAM into the
+          // CPU-visible BAR window, so the same direct host blit applies.
+          flags_ |= HostMemoryDirectAccess;
+        }
+#else
+        // Linux amdgpu_lite maps device-local VRAM into the CPU-visible BAR
+        // window; its agent has no SDMA/GART reach into host memory, so the
+        // shader blit through host staging silently fails. Opt-in: route
+        // hipMemcpy H2D/D2H through the direct host<->BAR memcpy. Gated so the
+        // real KFD amdgpu path (non-CPU-derefable VRAM) is untouched.
+        if (deviceMemory_ != nullptr &&
+            std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT") != nullptr) {
+          flags_ |= HostMemoryDirectAccess;
+        }
+#endif
       }
       owner()->setSvmPtr(deviceMemory_);
     } else {
@@ -1120,6 +1140,18 @@ bool Buffer::create(bool alloc_local) {
         const_cast<Device&>(dev()).updateFreeMemory(size(), false);
       }
     } else {
+#if defined(__APPLE__) || defined(_WIN32)
+      // Darwin's MVP local-memory pool is host-backed until the DEXT path
+      // exposes GPU VM/VRAM allocations, so CPU blits can access it directly.
+      // The Windows WindowsLiteDriver likewise exposes device-local memory
+      // through the CPU-visible BAR window.
+      flags_ |= HostMemoryDirectAccess;
+#else
+      // Linux amdgpu_lite lite:: path (see above): opt-in direct host<->BAR memcpy.
+      if (std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT") != nullptr) {
+        flags_ |= HostMemoryDirectAccess;
+      }
+#endif
       const_cast<Device&>(dev()).updateFreeMemory(size(), false);
     }
 
@@ -1276,7 +1308,7 @@ bool Buffer::ExportHandle(void* handle) const {
 // ================================================================================================
 bool Buffer::GetFDHandleForMem(void* dev_ptr, size_t size, bool vmm, void* handle) {
   int dmabuffd = -1;
-  size_t offset = 0;
+  uint64_t offset = 0;
 
   // In case of vmm, we use a different set of APIs for retrieving the dmabuffd.
   if (vmm) {

@@ -41,7 +41,7 @@ if (AMD_COMPUTE_WIN)
   target_compile_definitions(rocclr PUBLIC ROCR_STATIC_OPEN)
 else()
   if(UNIX)
-    find_package(hsa-runtime64 1.11 REQUIRED CONFIG
+    find_package(hsa-runtime64 REQUIRED CONFIG
       PATHS
         ${ROCM_PATH}
         ${ROCM_INSTALL_PATH}
@@ -50,7 +50,7 @@ else()
         lib/cmake/hsa-runtime64
         lib64/cmake/hsa-runtime64)
   else()
-    find_package(hsa-runtime64 1.11 REQUIRED CONFIG
+    find_package(hsa-runtime64 REQUIRED CONFIG
       PATHS
         ${ROCM_PATH}
         ${ROCM_INSTALL_PATH}
@@ -88,6 +88,11 @@ else()
 
   if (ROCR_DLL_LOAD)
     target_compile_definitions(rocclr PUBLIC ROCR_DYN_DLL)
+    # WindowsLiteDriver/lite:: ROCr: the dlopen (ROCR_DYN_DLL) path adds no import lib,
+    # but two HSA symbols are compiled in raw (hsa_amd_queue_get_info @ rocvirtual.cpp,
+    # hsa_amd_signal_get_event_id @ rocvirtual.cpp/.hpp). Link our shared import lib so
+    # they resolve; all other HSA symbols are still GetProcAddress'd at runtime.
+    target_link_libraries(rocclr PUBLIC hsa-runtime64::hsa-runtime64)
   else()
     if (STATIC_ROCR)
       target_link_libraries(rocclr PUBLIC hsa-runtime64::hsa-runtime64_static)

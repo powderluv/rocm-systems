@@ -5,6 +5,7 @@
  */
 
 #include "platform/commandqueue.hpp"
+#include <cstdlib>  // std::getenv (ROCR_AMDGPU_LITE_HOST_BLIT)
 #include "device/rocm/rocdevice.hpp"
 #include "device/rocm/rocblit.hpp"
 #include "device/rocm/rocmemory.hpp"
@@ -2451,7 +2452,12 @@ bool KernelBlitManager::fillBuffer1D(device::Memory& memory, const void* pattern
   bool result = false;
 
   // Use host fill if memory has direct access
-  if (setup_.disableFillBuffer_ || (!forceBlit && memory.isHostMemDirectAccess())) {
+  if (setup_.disableFillBuffer_ ||
+      // Linux amdgpu_lite lite:: path: honor the host<->BAR fill even when the
+      // SVM fill forces a blit (submitSvmFillMemory), so hipMemset uses the host
+      // memset instead of a GPU fill kernel that can't reach host memory.
+      ((!forceBlit || std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT") != nullptr) &&
+       memory.isHostMemDirectAccess())) {
     // Stall GPU before CPU access
     gpu().releaseGpuMemoryFence();
     result = HostBlitManager::fillBuffer(memory, pattern, patternSize, size, origin, size, entire);
@@ -2600,7 +2606,12 @@ bool KernelBlitManager::fillBuffer2D(device::Memory& memory, const void* pattern
   bool result = false;
 
   // Use host fill if memory has direct access
-  if (setup_.disableFillBuffer_ || (!forceBlit && memory.isHostMemDirectAccess())) {
+  if (setup_.disableFillBuffer_ ||
+      // Linux amdgpu_lite lite:: path: honor the host<->BAR fill even when the
+      // SVM fill forces a blit (submitSvmFillMemory), so hipMemset uses the host
+      // memset instead of a GPU fill kernel that can't reach host memory.
+      ((!forceBlit || std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT") != nullptr) &&
+       memory.isHostMemDirectAccess())) {
     // Stall GPU before CPU access
     gpu().releaseGpuMemoryFence();
     result = HostBlitManager::fillBuffer(memory, pattern, patternSize, size, origin, size, entire);
@@ -3268,6 +3279,19 @@ bool KernelBlitManager::copyBuffer(device::Memory& srcMemory, device::Memory& ds
                                    amd::CopyMetadata copyMetadata) const {
   std::scoped_lock k(lockXferOps_);
   bool result = false;
+  // lite copyBuffer host route: on Linux amdgpu_lite a small D2H to a PINNED host buffer
+  // (torch Tensor.item()/allclose) is seen as device<->device and would take the shader
+  // copy path, whose write to pinned host memory does not land on lite:: -> stale 0. Both
+  // sides are CPU-accessible, so do a straight host memcpy instead.
+  if (std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT") != nullptr &&
+      srcMemory.isHostMemDirectAccess() && !srcMemory.isCpuUncached() &&
+      dstMemory.isHostMemDirectAccess() && !dstMemory.isCpuUncached()) {
+    gpu().releaseGpuMemoryFence();
+    result = HostBlitManager::copyBuffer(srcMemory, dstMemory, srcOrigin, dstOrigin, sizeIn,
+                                         false, copyMetadata);
+    synchronize();
+    return result;
+  }
   uint32_t blitWg = dev().settings().limit_blit_wg_;
 
   const Memory& srcRocMemory = gpuMem(srcMemory);

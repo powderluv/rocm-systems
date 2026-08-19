@@ -65,6 +65,19 @@ enum class DriverType {
 #ifdef HSAKMT_VIRTIO_ENABLED
   KFD_VIRTIO,
 #endif
+#if defined(__linux__)
+  LINUX_AMDGPU_LITE,
+#endif
+#if defined(__APPLE__)
+  // macOS user-space GPU driver talking to a DriverKit extension
+  // (PCIDriverKit → Thunderbolt AMD eGPU). See plans/macos-egpu-rocm-plan.md.
+  MACOS_DEXT,
+#endif
+#if defined(_WIN32)
+  // Windows user-space GPU driver talking to the amdgpu_mcdm WDDM kernel-mode
+  // driver via D3DKMTEscape (third tri-OS lite:: backend).
+  WINDOWS_WDDM_LITE,
+#endif
   NUM_DRIVER_TYPES
 };
 

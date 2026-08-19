@@ -89,6 +89,26 @@ typedef uint64_t uint64;
 void log_printf(const char* file, int line, const char* format, ...);
 
 #if defined(__GNUC__)
+#if defined(__i386__) || defined(__x86_64__)
+#include <x86intrin.h>
+#elif defined(__aarch64__) || defined(__arm64__)
+// ARMv8 (Apple Silicon, Graviton) fallbacks for the x86 intrinsics ROCR
+// sprinkles through its code. Map each to the closest-semantics ARM
+// operation so surrounding memory-order / spin-wait logic keeps working.
+//   _mm_pause   → YIELD hint (spin-wait backoff)
+//   _mm_sfence  → DMB ISHST (inner-shareable store barrier)
+//   _mm_mfence  → DMB ISH   (inner-shareable full barrier)
+static __inline__ __attribute__((always_inline)) void _mm_pause(void) {
+  __asm__ __volatile__("yield" ::: "memory");
+}
+static __inline__ __attribute__((always_inline)) void _mm_sfence(void) {
+  __asm__ __volatile__("dmb ishst" ::: "memory");
+}
+static __inline__ __attribute__((always_inline)) void _mm_mfence(void) {
+  __asm__ __volatile__("dmb ish" ::: "memory");
+}
+#endif
+
 #define __forceinline __inline__ __attribute__((always_inline))
 #define __declspec(x) __attribute__((x))
 #undef __stdcall
@@ -449,7 +469,15 @@ inline void FlushCpuCache(const void* base, size_t offset, size_t len) {
   cur += offset;
   uintptr_t lastline = (uintptr_t)(cur + len - 1) | (cacheline_size - 1);
   do {
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
     _mm_clflush((const void*)cur);
+#elif defined(__aarch64__) || defined(__arm64__)
+    // Data cache clean and invalidate by virtual address to Point of
+    // Coherency. Matches CLFLUSH semantics for CPU↔DMA coherence flows.
+    __asm__ __volatile__("dc civac, %0" : : "r"(cur) : "memory");
+#else
+#error "FlushCpuCache: unsupported architecture"
+#endif
     cur += cacheline_size;
   } while (cur <= (const char*)lastline);
 }

@@ -492,11 +492,17 @@ bool Device::init() {
     if (amd::IS_HIP && ROC_GLOBAL_CU_MASK[0] != '\0') {
       roc_device->getGlobalCUMask(ROC_GLOBAL_CU_MASK);
     }
-    // Note: for now disable HSA path by default except for gfx942
+#if defined(WITH_PAL_DEVICE)
+    // Note: for now disable HSA path by default except for gfx942.
+    // Only relevant when a PAL backend is co-built to fall back to. An HSA-only
+    // build (e.g. the lite:: WindowsLiteDriver, ROCCLR_ENABLE_PAL=OFF) has no PAL
+    // to defer to, so firing this would wrongly drop every non-gfx942 GPU and
+    // leave zero devices. Compile it out unless PAL is actually built in.
     if (IS_WINDOWS && (GPU_ENABLE_PAL == 2) &&
         (std::string_view(roc_device->info().name_).find("gfx942") == std::string_view::npos)) {
       return false;
     }
+#endif
     roc_device.release()->registerDevice();
   }
 
@@ -1881,6 +1887,11 @@ device::VirtualDevice* Device::createVirtualDevice(amd::CommandQueue* queue) {
                      dedicated_queue);
 
   if (!virtualDevice->create()) {
+#if defined(__APPLE__)
+    if (virtualDevice->gpu_queue() == nullptr && virtualDevice->createHostBlitOnly()) {
+      return virtualDevice;
+    }
+#endif
     delete virtualDevice;
     return nullptr;
   }

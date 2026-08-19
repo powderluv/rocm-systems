@@ -23,6 +23,7 @@
 #include "os/os.hpp"
 
 #include <fstream>
+#include <cstdlib>
 #include <limits>
 
 #ifdef _WIN32
@@ -77,6 +78,20 @@ static constexpr uint16_t kNopPacketHeader =
     (HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE) | (1 << HSA_PACKET_HEADER_BARRIER) |
     (HSA_FENCE_SCOPE_NONE << HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE) |
     (HSA_FENCE_SCOPE_NONE << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE);
+
+class HostOnlyBlitManager final : public device::HostBlitManager {
+ public:
+  HostOnlyBlitManager(device::VirtualDevice& vdev, Setup setup) : HostBlitManager(vdev, setup) {}
+
+  bool streamOpsWrite(device::Memory&, uint64_t, size_t, size_t) const override { return false; }
+  bool streamOpsIncrement(device::Memory&, uint64_t, size_t, size_t) const override { return false; }
+  bool streamOpsDecrement(device::Memory&, uint64_t, size_t, size_t) const override { return false; }
+  bool streamOpsWait(device::Memory&, uint64_t, size_t, size_t, uint64_t, uint64_t) const override {
+    return false;
+  }
+  bool batchMemOps(const void*, size_t, uint32_t) const override { return false; }
+  bool initHeap(device::Memory*, device::Memory*, uint, uint) const override { return false; }
+};
 
 static constexpr uint16_t kBarrierPacketAcquireHeader =
     (HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE) | (1 << HSA_PACKET_HEADER_BARRIER) |
@@ -2250,6 +2265,10 @@ void VirtualGPU::ResetQueueStates() {
 
 // ================================================================================================
 bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait) {
+  if (!tracking_created_) {
+    return true;
+  }
+
   if (hasPendingDispatch_ || isFenceDirty() || !Barriers().IsExternalSignalListEmpty()) {
     // Dispatch barrier packet into the queue
     dispatchBarrierPacket(kBarrierPacketHeader);
@@ -2446,7 +2465,19 @@ bool VirtualGPU::create() {
   }
 
   device::BlitManager::Setup blitSetup;
-  blitMgr_ = new KernelBlitManager(*this, blitSetup);
+  const bool force_host_blit =
+#if defined(__APPLE__)
+      std::getenv("ROCR_MACOS_HOST_BLIT_ONLY") != nullptr;
+#else
+      std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT_ONLY") != nullptr;
+#endif
+  if (force_host_blit) {
+    blitSetup.disableAll();
+    blitMgr_ = new HostOnlyBlitManager(*this, blitSetup);
+  } else
+  {
+    blitMgr_ = new KernelBlitManager(*this, blitSetup);
+  }
   if ((nullptr == blitMgr_) || !blitMgr_->create(roc_device_)) {
     LogError("Could not create BlitManager!");
     return false;
@@ -2484,6 +2515,19 @@ bool VirtualGPU::create() {
   }
   // Release HW queue until the first usage
   ReleaseHwQueue();
+  return true;
+}
+
+// ================================================================================================
+bool VirtualGPU::createHostBlitOnly() {
+  delete blitMgr_;
+  device::BlitManager::Setup blitSetup;
+  blitSetup.disableAll();
+  blitMgr_ = new HostOnlyBlitManager(*this, blitSetup);
+  if ((nullptr == blitMgr_) || !blitMgr_->create(roc_device_)) {
+    LogError("Could not create host-only BlitManager!");
+    return false;
+  }
   return true;
 }
 
@@ -5066,6 +5110,12 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
  */
 // ================================================================================================
 void VirtualGPU::submitKernel(amd::NDRangeKernelCommand& vcmd) {
+  if (gpu_queue_ == nullptr) {
+    LogError("AQL dispatch unavailable: no HSA queue for Darwin host-only VirtualGPU");
+    vcmd.setStatus(CL_INVALID_OPERATION);
+    return;
+  }
+
   if (vcmd.cooperativeGroups()) {
     // Wait for the execution on the current queue, since the coop groups will use the device queue
     releaseGpuMemoryFence(kSkipCpuWait);

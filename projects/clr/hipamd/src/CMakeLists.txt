@@ -52,7 +52,7 @@ if(BUILD_SHARED_LIBS)
     set_target_properties(amdhip64 PROPERTIES RUNTIME_OUTPUT_NAME "amdhip64_${HIP_VERSION_MAJOR}")
   endif()
   # Windows doesn't have a strip utility, so CMAKE_STRIP won't be set.
-  if((CMAKE_BUILD_TYPE STREQUAL "Release") AND NOT ("${CMAKE_STRIP}" STREQUAL ""))
+  if((CMAKE_BUILD_TYPE STREQUAL "Release") AND NOT APPLE AND NOT ("${CMAKE_STRIP}" STREQUAL ""))
     add_custom_command(TARGET amdhip64 POST_BUILD COMMAND ${CMAKE_STRIP} $<TARGET_FILE:amdhip64>)
   endif()
 else()
@@ -155,7 +155,7 @@ if(BUILD_SHARED_LIBS)
     string(REPLACE "/" "\\" AMDHIP_DEF_OUTPUT_NATIVE "${AMDHIP_DEF_OUTPUT}")
     target_link_options(amdhip64 PRIVATE "/DEF:${AMDHIP_DEF_OUTPUT_NATIVE}")
     set_target_properties(amdhip64 PROPERTIES LINK_DEPENDS "${AMDHIP_DEF_OUTPUT}")
-  else()
+  elseif(NOT APPLE)
     target_link_libraries(amdhip64 PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_LIST_DIR}/hip_hcc.map.in")
     set_target_properties(amdhip64 PROPERTIES LINK_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/hip_hcc.map.in")
   endif()
@@ -230,8 +230,15 @@ if(__HIP_ENABLE_PCH)
   target_sources(amdhip64 PRIVATE ${CMAKE_BINARY_DIR}/hip_pch.o)
 endif()
 
-# Add hiprtc
-add_subdirectory(hiprtc)
+# Add hiprtc (gated for the initial Windows ROCr-backend bring-up: hiprtc needs ROCm
+# clang + llvm-mc at build time, absent on a plain MSVC host, and is not needed for
+# loading pre-finalized code objects. Default ON; pass -DHIP_BUILD_HIPRTC=OFF to skip.)
+if(NOT DEFINED HIP_BUILD_HIPRTC)
+  set(HIP_BUILD_HIPRTC ON)
+endif()
+if(HIP_BUILD_HIPRTC)
+  add_subdirectory(hiprtc)
+endif()
 
 # HRR in-tree capture layer
 add_subdirectory(hrr)
@@ -308,7 +315,9 @@ if(USE_PROF_API)
   add_dependencies(amdhip64 gen-prof-api-str-header)
 endif()
 
-target_compile_definitions(amdhip64 PUBLIC USE_PROF_API=1)
+if(USE_PROF_API)
+  target_compile_definitions(amdhip64 PUBLIC USE_PROF_API=1)
+endif()
 
 if(WIN32 OR NOT BUILD_SHARED_LIBS)
     # rocprofiler-register is not support on Windows

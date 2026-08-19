@@ -62,7 +62,13 @@
 #include "loader/executable.hpp"
 #endif
 
+#ifndef _WIN32
+// r_debug is from <link.h> (Linux) or link_darwin.h (macOS).
+// On WIN32 it is defined in loader/executable.hpp (included above) and the
+// symbol itself lives in loader/executable.cpp -- the extern is redundant here
+// and would shadow the definition; suppress it on WIN32.
 extern r_debug _amdgpu_r_debug;
+#endif
 
 namespace rocr {
 
@@ -114,6 +120,11 @@ KfdDriver::KfdDriver(std::string devnode_name)
     : core::Driver(core::DriverType::KFD, std::move(devnode_name)) {}
 
 hsa_status_t KfdDriver::Init() {
+#ifdef _WIN32
+  // KFD (/dev/kfd) is a Linux-only backend; on Windows WindowsLiteDriver is
+  // the active driver and KfdDriver is only a no-device discovery stub.
+  return HSA_STATUS_ERROR;
+#else
   HSAKMT_STATUS ret =
       HSAKMT_CALL(hsaKmtRuntimeEnable(&_amdgpu_r_debug, core::Runtime::runtime_singleton_->flag().debug()));
 
@@ -141,6 +152,7 @@ hsa_status_t KfdDriver::Init() {
   core::Runtime::runtime_singleton_->XnackEnabled(xnack_mode);
 
   return HSA_STATUS_SUCCESS;
+#endif
 }
 
 hsa_status_t KfdDriver::ShutDown() {
@@ -155,6 +167,13 @@ hsa_status_t KfdDriver::ShutDown() {
 }
 
 hsa_status_t KfdDriver::DiscoverDriver(std::unique_ptr<core::Driver>& driver) {
+#ifdef _WIN32
+  // KFD is Linux-only; on Windows the DXG thunk's hsaKmtOpenKFD() succeeds and
+  // would register a no-device KfdDriver whose Init() fails the whole topology.
+  // The WindowsLiteDriver is the Windows lite:: backend.
+  (void)driver;
+  return HSA_STATUS_ERROR;
+#else
   auto tmp_driver = std::unique_ptr<core::Driver>(new KfdDriver("/dev/kfd"));
 
   if (tmp_driver->Open() == HSA_STATUS_SUCCESS) {
@@ -163,6 +182,7 @@ hsa_status_t KfdDriver::DiscoverDriver(std::unique_ptr<core::Driver>& driver) {
   }
 
   return HSA_STATUS_ERROR;
+#endif
 }
 
 hsa_status_t KfdDriver::QueryKernelModeDriver(core::DriverQuery query) {
