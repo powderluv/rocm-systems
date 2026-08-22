@@ -2535,7 +2535,7 @@ hsa_status_t CreateDirectQueue(const DirectQueuePlatform& platform,
   // CP never polls the in-memory wptr the MMIO poke updates on the dead-doorbell
   // amdgpu_lite transport (cp=0). Env-gated so macOS's live doorbell is intact.
   {
-    if (options.poll_wptr) {
+    if (options.poll_wptr && !options.use_doorbell_wptr) {
       platform.WriteMmio32(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, 1u);
     }
   }
@@ -3032,14 +3032,14 @@ hsa_status_t SubmitDirectQueue(const DirectQueuePlatform& platform,
   // polling so the CP picks up the in-memory wptr, mirroring the mes_backed
   // submit. Gated (default off) so macOS's live-doorbell direct path is intact.
   {
-    if (options.poll_wptr) {
+    if (options.poll_wptr && !options.use_doorbell_wptr) {
       platform.WriteMmio32(kGcBase0, regCP_PQ_WPTR_POLL_CNTL, 1u);
     }
   }
   const char* mmio_wptr_env = std::getenv("ROCR_MACOS_DIRECT_QUEUE_MMIO_WPTR");
   const bool skip_mmio_wptr =
       mmio_wptr_env != nullptr && std::strcmp(mmio_wptr_env, "0") == 0;
-  if (!skip_mmio_wptr) {
+  if (!skip_mmio_wptr && !options.use_doorbell_wptr) {
     status = platform.WriteMmio32(kGcBase0, regCP_HQD_PQ_WPTR_LO,
                                   static_cast<uint32_t>(new_wptr));
     if (status == HSA_STATUS_SUCCESS) {

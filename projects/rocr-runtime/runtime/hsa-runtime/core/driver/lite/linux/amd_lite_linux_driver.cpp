@@ -102,6 +102,10 @@ lite::DirectQueueOptions LinuxDirectQueueOptions() {
   // Doorbell-dead amdgpu_lite transport: default the wptr-poll + MEC-doorbell
   // bring-up on (env=0 disables). Folds DIRECT_WPTR_POLL / DIRECT_MEC_DOORBELL.
   options.poll_wptr = EnvOnByDefault("ROCR_AMDGPU_LITE_DIRECT_WPTR_POLL");
+  // #75: rely on the live doorbell for the wptr; drop the poll workaround that
+  // wraps ambiguously. ROCR_AMDGPU_LITE_DIRECT_USE_DOORBELL=0 restores polling.
+  options.use_doorbell_wptr =
+      EnvOnByDefault("ROCR_AMDGPU_LITE_DIRECT_USE_DOORBELL");
   options.mec_doorbell = EnvOnByDefault("ROCR_AMDGPU_LITE_DIRECT_MEC_DOORBELL");
   options.skip_destroy = SkipDirectQueueDestroy();
   options.trace = TraceDirectQueue();

@@ -83,6 +83,12 @@ struct DirectQueueOptions {
   // Default false so macOS/Windows direct queues are unchanged; set by
   // LinuxDirectQueueOptions.
   bool poll_wptr = false;
+  // #75 fix: deliver the ring wptr via the live offset-6 doorbell (monotonic,
+  // wrap-safe) instead of the CP_PQ_WPTR_POLL workaround (ring-relative/masked
+  // wptr, ambiguous at the 8192-dw wrap). When set, Create/SubmitDirectQueue
+  // skip CP_PQ_WPTR_POLL_CNTL + the MMIO wptr poke but KEEP the full HQD program
+  // (priority regs, DOORBELL_EN). Default off; the Linux driver turns it on.
+  bool use_doorbell_wptr = false;
   bool mec_doorbell = false;
   bool skip_destroy = false;
   bool trace = false;
