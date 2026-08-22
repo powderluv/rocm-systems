@@ -697,18 +697,30 @@ hsa_status_t LiteAqlQueue::SubmitPm4AndWait(const std::vector<uint32_t>& input_p
   const uint32_t expected_rptr = static_cast<uint32_t>(direct_queue_.wptr);
   bool rptr_done = false;
   for (uint32_t i = 0; i < 50000; ++i) {
+    bool done = false;
     uint32_t rptr = 0;
-    if (driver_.ReadDirectComputeRptr(direct_queue_, &rptr) == HSA_STATUS_SUCCESS &&
-        static_cast<int32_t>(rptr - expected_rptr) >= 0) {
-      rptr_done = true;
-      if (rptr_only || *marker_cpu_ == marker_value_) {
-        if (TraceAql()) {
-          std::fprintf(stderr,
-                       "ROCR amdgpu_lite PM4 complete rptr=%u marker=%u completion=%s\n",
-                       rptr, marker_value_, rptr_only ? "rptr-only" : "write-data-marker");
-        }
-        return HSA_STATUS_SUCCESS;
+    if (rptr_only) {
+      // Debug mode: ring-relative CP_HQD_PQ_RPTR vs absolute wptr -- only valid
+      // pre-wrap; kept for diagnostics, not the torch path.
+      if (driver_.ReadDirectComputeRptr(direct_queue_, &rptr) == HSA_STATUS_SUCCESS &&
+          static_cast<int32_t>(rptr - expected_rptr) >= 0) {
+        rptr_done = true;
+        done = true;
       }
+    } else if (*marker_cpu_ == marker_value_) {
+      // #75: the WriteData marker is written by the CP AFTER the dispatch drains
+      // and is wrap-independent (the ring-relative rptr compare breaks at the
+      // 8192-dw wrap). This is the correct completion signal.
+      rptr_done = true;
+      done = true;
+    }
+    if (done) {
+      if (TraceAql()) {
+        std::fprintf(stderr,
+                     "ROCR amdgpu_lite PM4 complete rptr=%u marker=%u completion=%s\n",
+                     rptr, marker_value_, rptr_only ? "rptr-only" : "write-data-marker");
+      }
+      return HSA_STATUS_SUCCESS;
     }
     ::usleep(100);
   }
