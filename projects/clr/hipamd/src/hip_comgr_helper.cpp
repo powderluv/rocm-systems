@@ -763,6 +763,14 @@ bool RTCProgram::findIsa() {
 #ifdef _WIN32
   std::string dll_name = std::string("amdhip64_" + std::to_string(HIP_VERSION_MAJOR) + ".dll");
   libName = dll_name.c_str();
+#elif defined(__APPLE__)
+  // macOS uses the Mach-O dylib name (libamdhip64.<major>.dylib), not the ELF
+  // "libamdhip64.so.<major>" — otherwise dlopen fails, findIsa returns empty,
+  // and HIPRTC runtime compiles error "Please provide architecture" (e.g. MIOpen
+  // naive-conv on the lite:: path).
+  std::string dylib_name =
+      std::string("libamdhip64." + std::to_string(HIP_VERSION_MAJOR) + ".dylib");
+  libName = dylib_name.c_str();
 #else
   std::string so_name = std::string("libamdhip64.so." + std::to_string(HIP_VERSION_MAJOR));
   libName = so_name.c_str();

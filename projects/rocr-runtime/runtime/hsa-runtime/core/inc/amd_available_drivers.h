@@ -56,4 +56,10 @@
 #include "core/inc/amd_xdna_driver.h"
 #endif
 
+#ifdef _WIN32
+// Windows lite:: backend over the amdgpu_mcdm WDDM kernel-mode driver
+// (third tri-OS backend alongside Linux amdgpu_lite and the macOS DEXT).
+#include "core/inc/amd_windows_lite_driver.h"
+#endif
+
 #endif  // header guard

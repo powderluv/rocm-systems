@@ -73,6 +73,11 @@ enum class DriverType {
   // (PCIDriverKit → Thunderbolt AMD eGPU). See plans/macos-egpu-rocm-plan.md.
   MACOS_DEXT,
 #endif
+#if defined(_WIN32)
+  // Windows user-space GPU driver talking to the amdgpu_mcdm WDDM kernel-mode
+  // driver via D3DKMTEscape (third tri-OS lite:: backend).
+  WINDOWS_WDDM_LITE,
+#endif
   NUM_DRIVER_TYPES
 };
 

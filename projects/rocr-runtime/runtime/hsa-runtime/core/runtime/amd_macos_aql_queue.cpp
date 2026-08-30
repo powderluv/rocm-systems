@@ -591,17 +591,15 @@ hsa_status_t MacAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& packe
   if ((kd->kernel_code_properties & kPropPrivateSegmentBuffer) != 0) {
     return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
   }
-  // KNOWN-INCOMPLETE on this no-MES path. gfx12 uses architected flat scratch:
-  // FLAT_SCRATCH is a readonly, SPI-initialized register, and the SPI sources
-  // the per-wave scratch base from per-QUEUE state (MQD / amd_queue_t) that MES
-  // normally programs. The register writes below (DISPATCH_SCRATCH_BASE +
-  // TMPRING) plus the SH_MEM_BASES/CONFIG aperture set up in the bring-up are
-  // necessary but NOT sufficient without that per-queue scratch state: a
-  // scratch-using kernel still faults the CP with FLAT_SCRATCH=0 (GCVM L2
-  // permission fault at VA 0). Until per-queue scratch is wired (via MES
-  // submission or MQD scratch fields), the knob below defaults OFF and we reject
-  // scratch-using kernels cleanly (OUT_OF_RESOURCES) instead of wedging the GPU.
-  const bool enable_scratch = EnvEnabled("ROCR_MACOS_AQL_ENABLE_SCRATCH");
+  // gfx12 architected flat scratch. Enabled by default: a register-spilling
+  // kernel runs correctly on both the direct-MEC and MES paths (HW-validated on
+  // gfx1201, SCRATCH PASS). The per-dispatch DISPATCH_SCRATCH_BASE + TMPRING +
+  // static_thread_mgmt writes below (with TMPRING no longer re-zeroed by the
+  // RESOURCE_LIMITS block, see the note there) plus the SH_MEM_BASES/CONFIG
+  // aperture from bring-up are what the SPI needs to init FLAT_SCRATCH. Opt-out
+  // via ROCR_MACOS_AQL_DISABLE_SCRATCH (falls back to rejecting spilling kernels
+  // cleanly with OUT_OF_RESOURCES).
+  const bool enable_scratch = !EnvEnabled("ROCR_MACOS_AQL_DISABLE_SCRATCH");
   // A kernel uses scratch iff it has a nonzero per-work-item private segment.
   // gfx12 architected scratch does NOT set kPropFlatScratchInit, so don't key on
   // that. Take the larger of packet and descriptor sizes. (RSRC2.ENABLE_PRIVATE_
@@ -766,8 +764,15 @@ hsa_status_t MacAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& packe
     if (resource_zero) {
       SetShReg(pm4, COMPUTE_RESOURCE_LIMITS, {0});
     } else {
+      // NOTE: this 6-dword block spans 0x2E15..0x2E1A, and on gfx12
+      // COMPUTE_TMPRING_SIZE (0x2E18) is interleaved between static_thread_mgmt
+      // SE1 (0x2E17) and SE2 (0x2E19). Index 3 MUST carry compute_tmpring_size
+      // (0 for non-scratch dispatches) or it re-zeroes the TMPRING set above,
+      // giving WAVES=0 -> FLAT_SCRATCH=0 -> GCVM perm-fault @ VA0 (#15). Do not
+      // replace index 3 with a literal 0.
       SetShReg(pm4, COMPUTE_RESOURCE_LIMITS,
-               {0x3ff, 0xffffffff, 0xffffffff, 0, 0xffffffff, 0xffffffff});
+               {0x3ff, 0xffffffff, 0xffffffff, compute_tmpring_size, 0xffffffff,
+                0xffffffff});
     }
   }
   SetShReg(pm4, COMPUTE_START_X,

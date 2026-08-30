@@ -266,6 +266,10 @@ else()
                 core/driver/lite/linux/amd_lite_linux_transport.cpp
                 core/runtime/amd_lite_aql_queue.cpp
                 core/runtime/amd_lite_agent.cpp)
+  elseif (WIN32)
+    # Windows lite:: backend over the amdgpu_mcdm WDDM KMD (D3DKMTEscape).
+    list(APPEND SRCS
+                core/driver/lite/windows/amd_windows_lite_driver.cpp)
   endif()
 endif()
 list(APPEND SRCS
@@ -502,6 +506,9 @@ else()
   target_link_libraries ( ${CORE_RUNTIME_TARGET} PRIVATE Ws2_32 )
   target_link_directories(${CORE_RUNTIME_TARGET} PRIVATE ${DXCORE_LIB_PATH})
   target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE dxcore)
+  # D3DKMT (D3DKMTOpenAdapterFromDeviceName / D3DKMTEscape) for the
+  # amdgpu_mcdm WDDM lite:: backend lives in gdi32.
+  target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE gdi32)
 endif()
 
 # For static package rocprofiler-register dependency is not required
