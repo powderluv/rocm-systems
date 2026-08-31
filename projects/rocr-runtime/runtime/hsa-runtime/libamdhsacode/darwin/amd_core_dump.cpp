@@ -61,6 +61,8 @@
 // harvester that writes a .dmp file parallel to the Linux core dump format.
 
 #ifdef __APPLE__
+#include <vector>
+
 #include "hsa.h"
 #include "core/inc/amd_core_dump.hpp"
 
@@ -68,7 +70,10 @@ namespace rocr {
 namespace amd {
 namespace coredump {
 
-hsa_status_t dump_gpu_core() {
+// Signature must match the develop header (takes the suspended-queue vector,
+// defaulted at the declaration). The argument is unused on Darwin.
+hsa_status_t dump_gpu_core(std::vector<AMD::AqlQueue*>* suspended_queues) {
+  (void)suspended_queues;
   // No-op on Darwin. See file comment for rationale.
   return HSA_STATUS_SUCCESS;
 }

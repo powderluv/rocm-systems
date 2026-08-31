@@ -972,6 +972,40 @@ void CloseIPCSocket(IPCSocket sock) {
     close(IPCSockToFd(sock));
 }
 
+// --- POSIX-portable os:: helpers added on develop; ported from os_linux.cpp ---
+
+std::string GetAdjacentLibraryPath(const void* address, const std::string& filename) {
+  Dl_info info = {};
+  if (dladdr(address, &info) == 0 || info.dli_fname == nullptr) return {};
+
+  const std::string path(info.dli_fname);
+  const auto slash = path.find_last_of('/');
+  return slash == std::string::npos ? std::string{} : path.substr(0, slash + 1) + filename;
+}
+
+hsa_status_t DmaBufClose(int* dmabuf) {
+  if (dmabuf == nullptr) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  if (*dmabuf < 0) return HSA_STATUS_SUCCESS;
+  if (::close(*dmabuf) != 0) {
+    *dmabuf = -1;
+    return HSA_STATUS_ERROR_RESOURCE_FREE;
+  }
+  /* Set to -1 even on close failure: the fd is no longer valid regardless of errno. */
+  *dmabuf = -1;
+  return HSA_STATUS_SUCCESS;
+}
+
+int DmaBufDup(int dmabuf) {
+  if (dmabuf < 0) return -1;
+  int dup_fd = ::dup(dmabuf);
+  if (dup_fd < 0) {
+    return -1;
+  }
+  return dup_fd;
+}
+
+int Popcount(uint32_t i) { return __builtin_popcount(i); }
+
 }   //  namespace os
 }   //  namespace rocr
 

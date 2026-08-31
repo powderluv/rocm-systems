@@ -32,9 +32,7 @@
 #include <string_view>
 
 #include <dlfcn.h>
-#include <elf.h>
 #include <fmt/format.h>
-#include <link.h>
 #include <sys/types.h>
 #include <unistd.h>
 

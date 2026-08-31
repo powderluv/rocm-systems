@@ -50,6 +50,10 @@
 #include <linux/limits.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include <limits.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #elif defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #include <cstdint>
@@ -217,7 +221,7 @@ std::string GetUriFromMemoryInExecutableFile(const void *memory, size_t size) {
              << "#offset=" << file_offset
              << "&size=" << size;
   return uri_stream.str();
-#else
+#elif defined(__linux__)
   uintptr_t address = reinterpret_cast<uintptr_t>(memory);
   struct callback_data_s {
     ElfW(Addr) address;

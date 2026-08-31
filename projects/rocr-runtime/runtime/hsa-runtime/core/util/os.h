@@ -56,6 +56,7 @@ namespace os {
 typedef void* LibHandle;
 typedef void* Semaphore;
 typedef void* Mutex;
+typedef void* SharedMutex;
 typedef void* Thread;
 typedef void* EventHandle;
 

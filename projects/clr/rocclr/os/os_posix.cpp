@@ -6,7 +6,9 @@
 
 #if !defined(_WIN32) && !defined(__CYGWIN__)
 #include <unistd.h>
+#if defined(__linux__)
 #include <sys/syscall.h>
+#endif
 #include "os/os.hpp"
 #include "thread/thread.hpp"
 
@@ -18,7 +20,9 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#if defined(__linux__)
 #include <sys/sysinfo.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -26,10 +30,17 @@
 #include <signal.h>
 #include <cxxabi.h>
 
+#if defined(__linux__)
 #include <sys/prctl.h>
+#endif
 #include <sys/resource.h>
 
+#if defined(__linux__)
 #include <link.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <sys/sysctl.h>
+#endif
 #include <time.h>
 #ifndef DT_GNU_HASH
 #define DT_GNU_HASH 0x6ffffef5
@@ -46,6 +57,11 @@
 #include <algorithm>
 #include <mutex>
 #include <fstream>
+#include <libgen.h>
+
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
 
 namespace amd {
 
@@ -80,6 +96,7 @@ void ReleaseThreadAffinityState() {
 }
 
 bool GetCurrentThreadAffinity(std::vector<uint64_t>* affinity) {
+#if defined(__linux__)
   const uint32_t size = CPU_ALLOC_SIZE(amd::Os::processorCount());
   affinity->assign((size + sizeof(uint64_t) - 1) / sizeof(uint64_t), 0);
   if (syscall(__NR_sched_getaffinity, 0, size, affinity->data()) < 0) {
@@ -88,9 +105,14 @@ bool GetCurrentThreadAffinity(std::vector<uint64_t>* affinity) {
     return false;
   }
   return true;
+#else
+  // Thread affinity control is not supported on this platform.
+  return false;
+#endif
 }
 
 bool SetCurrentThreadAffinity(const std::vector<uint64_t>& affinity) {
+#if defined(__linux__)
   const uint32_t size = static_cast<uint32_t>(affinity.size() * sizeof(uint64_t));
   if (syscall(__NR_sched_setaffinity, 0, size, affinity.data()) < 0) {
     ClPrint(amd::LOG_DEBUG, amd::LOG_RESOURCE,
@@ -98,6 +120,10 @@ bool SetCurrentThreadAffinity(const std::vector<uint64_t>& affinity) {
     return false;
   }
   return true;
+#else
+  // Thread affinity control is not supported on this platform.
+  return false;
+#endif
 }
 
 bool IsCpuSet(const std::vector<uint64_t>& affinity, uint32_t cpu) {
@@ -236,12 +262,14 @@ static void divisionErrorHandler(int sig, siginfo_t* info, void* ptr) {
   ::abort();
 }
 
+#if defined(__linux__)
 typedef int (*pthread_setaffinity_fn)(pthread_t, size_t, const cpu_set_t*);
 static pthread_setaffinity_fn pthread_setaffinity_fptr;
+static cpu_set_t nativeMask_;
+#endif
 
 static void init() __attribute__((constructor(101)));
 static void init() { Os::init(); }
-static cpu_set_t nativeMask_;
 
 bool Os::installSigfpeHandler() {
   // Install a SIGFPE signal handler @todo: Chain the handlers
@@ -271,8 +299,10 @@ bool Os::init() {
   pageSize_ = (size_t)::sysconf(_SC_PAGESIZE);
   processorCount_ = ::sysconf(_SC_NPROCESSORS_CONF);
 
+#if defined(__linux__)
   pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &nativeMask_);
   pthread_setaffinity_fptr = (pthread_setaffinity_fn)dlsym(RTLD_NEXT, "pthread_setaffinity_np");
+#endif
 
   return Thread::init();
 }
@@ -340,6 +370,7 @@ address Os::reserveMemory(address start, size_t size, size_t alignment, MemProt 
     }
   }
 
+#if defined(__linux__)
   // Hint to enable THP for large host allocations which can help in performance gain
   constexpr size_t kLargePageSize = 2 * Mi;
   if (size >= kLargePageSize) {
@@ -351,6 +382,7 @@ address Os::reserveMemory(address start, size_t size, size_t alignment, MemProt 
               aligned, size, status, strerror(errno));
     }
   }
+#endif
 
   return aligned;
 }
@@ -412,6 +444,11 @@ void Os::currentStackInfo(address* base, size_t* size) {
   // at load time (a binary loads the OpenCL/HIP app/runtime dynamically.
   // We should look into this... -laurent
 
+#if defined(__APPLE__)
+  pthread_t self = ::pthread_self();
+  *base = reinterpret_cast<address>(pthread_get_stackaddr_np(self));
+  *size = pthread_get_stacksize_np(self);
+#else
   pthread_t self = ::pthread_self();
 
   pthread_attr_t threadAttr;
@@ -425,12 +462,19 @@ void Os::currentStackInfo(address* base, size_t* size) {
   *base += *size;
 
   ::pthread_attr_destroy(&threadAttr);
+#endif
 
   assert(Os::currentStackPtr() >= *base - *size && Os::currentStackPtr() < *base &&
          "just checking");
 }
 
-void Os::setCurrentThreadName(const char* name) { ::prctl(PR_SET_NAME, name); }
+void Os::setCurrentThreadName(const char* name) {
+#if defined(__APPLE__)
+  ::pthread_setname_np(name);
+#else
+  ::prctl(PR_SET_NAME, name);
+#endif
+}
 
 void* Thread::entry(Thread* thread) {
   sigset_t set;
@@ -801,6 +845,15 @@ address Os::currentStackPtr() {
 }
 
 size_t Os::getPhysicalMemSize() {
+#if defined(__APPLE__)
+  uint64_t mem_bytes = 0;
+  size_t len = sizeof(mem_bytes);
+  int mib[2] = {CTL_HW, HW_MEMSIZE};
+  if (sysctl(mib, 2, &mem_bytes, &len, nullptr, 0) != 0) {
+    return 0;
+  }
+  return static_cast<size_t>(mem_bytes);
+#else
   struct ::sysinfo si;
 
   if (::sysinfo(&si) != 0) {
@@ -813,11 +866,22 @@ size_t Os::getPhysicalMemSize() {
   }
 
   return (size_t)si.totalram * si.mem_unit;
+#endif
 }
 
 void Os::getAppPathAndFileName(std::string& appName, std::string& appPathAndName) {
   std::unique_ptr<char[]> buff(new char[FILE_PATH_MAX_LENGTH]());
 
+#if defined(__APPLE__)
+  uint32_t size = FILE_PATH_MAX_LENGTH;
+  if (_NSGetExecutablePath(buff.get(), &size) == 0) {
+    appName = std::string(basename(buff.get()));
+    appPathAndName = std::string(buff.get());
+  } else {
+    appName = "";
+    appPathAndName = "";
+  }
+#else
   if (readlink("/proc/self/exe", buff.get(), FILE_PATH_MAX_LENGTH) > 0) {
     // Get filename without path and extension.
     appName = std::string(basename(buff.get()));
@@ -826,6 +890,7 @@ void Os::getAppPathAndFileName(std::string& appName, std::string& appPathAndName
     appName = "";
     appPathAndName = "";
   }
+#endif
   return;
 }
 
@@ -877,6 +942,15 @@ bool Os::GetFileHandle(const char* fname, FileDesc* fd_ptr, size_t* sz_ptr) {
 
 bool amd::Os::FindFileNameFromAddress(const void* image, std::string* fname_ptr,
                                       size_t* foffset_ptr) {
+#if defined(__APPLE__)
+  Dl_info info;
+  if (dladdr(image, &info) && info.dli_fname != nullptr) {
+    *fname_ptr = info.dli_fname;
+    *foffset_ptr = reinterpret_cast<uintptr_t>(image) - reinterpret_cast<uintptr_t>(info.dli_fbase);
+    return true;
+  }
+  return false;
+#else
   // Get the list of mapped file list
   bool ret_value = false;
   std::ifstream proc_maps;
@@ -918,6 +992,7 @@ bool amd::Os::FindFileNameFromAddress(const void* image, std::string* fname_ptr,
   }
 
   return ret_value;
+#endif
 }
 
 bool Os::MemoryMapFileDesc(FileDesc fdesc, size_t fsize, size_t foffset, const void** mmap_ptr) {
@@ -1070,11 +1145,15 @@ namespace numa {
 
 // ================================================================================================
 uint32_t getCurrentNumaNode() {
+#if defined(__linux__)
   unsigned cpu, node;
   if (syscall(__NR_getcpu, &cpu, &node, nullptr) < 0) {
     return static_cast<uint32_t>(-1);
   }
   return static_cast<uint32_t>(node);
+#else
+  return static_cast<uint32_t>(-1);
+#endif
 }
 
 // ================================================================================================
@@ -1083,6 +1162,7 @@ NumaPolicy::NumaPolicy(const uint32_t numa_node_count) :
 
 // ================================================================================================
 bool NumaPolicy::GetMemPolicy() {
+#if defined(__linux__)
   int policy = 0;
   if (syscall(__NR_get_mempolicy, &policy, node_map_.data(),
       node_map_.size() * kBitsPerUInt64, nullptr, 0) < 0) {
@@ -1098,6 +1178,9 @@ bool NumaPolicy::GetMemPolicy() {
   }
   policy_ = static_cast<Policy>(policy);
   return true;
+#else
+  return false;
+#endif
 }
 
 // ================================================================================================
@@ -1160,6 +1243,7 @@ bool NumaNode::GetAffinity() {
 
 // ================================================================================================
 bool NumaNode::SchedSetAffinity() {
+#if defined(__linux__)
   if (!GetAffinity()) {
     return false;
   }
@@ -1170,6 +1254,9 @@ bool NumaNode::SchedSetAffinity() {
     return false;
   }
   return true;
+#else
+  return false;
+#endif
 }
 
 // ================================================================================================
