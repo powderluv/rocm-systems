@@ -117,6 +117,12 @@ MacGpuAgent::MacGpuAgent(uint32_t node_id, core::DriverType driver_type)
 
 MacGpuAgent::~MacGpuAgent() = default;
 
+// macOS has a single CPU node; return the first CPU agent as the nearest.
+core::Agent* MacGpuAgent::GetNearestCpuAgent() const {
+  for (auto* cpu : core::Runtime::runtime_singleton_->cpu_agents()) return cpu;
+  return nullptr;
+}
+
 void MacGpuAgent::ReleaseResources() {
   // Nothing held yet.
 }

@@ -2826,8 +2826,8 @@ hsa_status_t Runtime::Load() {
   svm_profile_.reset(new AMD::SvmProfileControl);
 #else
   if (!flag_.svm_profile().empty()) {
-    debug_warning("HSA_SVM_PROFILE=%s is only supported on Linux; ignoring.",
-                  flag_.svm_profile().c_str());
+    debug_print("HSA_SVM_PROFILE=%s is only supported on Linux; ignoring.\n",
+                flag_.svm_profile().c_str());
   }
 #endif
 

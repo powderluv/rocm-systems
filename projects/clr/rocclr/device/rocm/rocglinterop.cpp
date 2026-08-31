@@ -32,7 +32,9 @@ bool Export(mesa_glinterop_export_in& in, mesa_glinterop_export_out& out, MESA_I
   return false;
 }
 
-bool glAssociate(Device* device, uint flags, void* gfxContext, void* glDevice) {
+bool glAssociate(Device* device, uint flags, void* gfxContext, void* glDevice,
+                 bool validateOnly) {
+  static_cast<void>(validateOnly);
   return false;
 }
 
