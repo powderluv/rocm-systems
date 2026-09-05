@@ -123,6 +123,12 @@ WindowsGpuAgent::WindowsGpuAgent(uint32_t node_id, core::DriverType driver_type)
 
 WindowsGpuAgent::~WindowsGpuAgent() = default;
 
+// Windows has a single CPU node; return the first CPU agent as the nearest.
+core::Agent* WindowsGpuAgent::GetNearestCpuAgent() const {
+  for (auto* cpu : core::Runtime::runtime_singleton_->cpu_agents()) return cpu;
+  return nullptr;
+}
+
 void WindowsGpuAgent::ReleaseResources() {
   // Nothing held yet.
 }

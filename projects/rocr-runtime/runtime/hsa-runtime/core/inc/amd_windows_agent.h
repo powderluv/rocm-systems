@@ -168,6 +168,8 @@ class WindowsGpuAgent : public GpuAgentInt {
 
   hsa_status_t GetInfo(hsa_agent_info_t attribute, void* value) const override;
 
+  core::Agent* GetNearestCpuAgent() const override;
+
   void InitDerivedCuid() override {}
 
   const std::vector<std::shared_ptr<const core::MemoryRegion>>& regions() const override {
