@@ -50,7 +50,13 @@ if( NOT _is_hsa_runtime_dynamic )
 
   set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_LIST_DIR}")
 
-  if(NOT WIN32)
+  # hsakmt-staticdrm is only omitted from the export interface on Apple
+  # (Darwin static builds link the macgpu shim instead of hsakmt). Windows
+  # static builds (hsakmt-staticdrm via HSAKMT_WDDM_LITE) DO need this, same
+  # as Linux static builds -- do not special-case WIN32 out here, or
+  # consumers (e.g. hip-clr) will hit a missing hsakmt-staticdrm target when
+  # loading hsa-runtime64Targets.cmake below.
+  if(NOT APPLE)
     find_dependency(hsakmt 1.0)
   endif()
   if (UNIX)

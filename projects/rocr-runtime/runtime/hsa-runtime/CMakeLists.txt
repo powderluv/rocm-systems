@@ -158,7 +158,10 @@ elseif (APPLE)
   target_include_directories(${CORE_RUNTIME_TARGET} PRIVATE ${LIBELF_INCLUDE_DIRS})
 else()
   target_include_directories(${CORE_RUNTIME_TARGET} PRIVATE ${LIBELF_INCLUDE_DIR})
-  if (${BUILD_SHARED_LIBS})
+  # Link oclelf regardless of BUILD_SHARED_LIBS: TheRock's Windows build is
+  # static-only (BUILD_SHARED_LIBS=OFF), and amd_elf_image.cpp still calls
+  # into libelf either way.
+  if(TARGET oclelf)
     target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE oclelf)
   endif()
 endif()
@@ -644,6 +647,9 @@ if( NOT ${BUILD_SHARED_LIBS} )
   else()
     target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE hsakmt-staticdrm::hsakmt-staticdrm )
     target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE Ws2_32 )
+    if(TARGET oclelf)
+      target_link_libraries ( ${CORE_RUNTIME_NAME} INTERFACE oclelf )
+    endif()
   endif()
   install ( TARGETS ${CORE_RUNTIME_NAME} EXPORT ${CORE_RUNTIME_NAME}Targets )
 endif()
@@ -654,6 +660,12 @@ if (WIN32)
   install ( TARGETS ${CORE_RUNTIME_TARGET} EXPORT ${CORE_RUNTIME_NAME}Targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT binary )
+  if(TARGET oclelf)
+    # oclelf (elf::elf) is a link dependency of hsa-runtime64_static above, so
+    # it must join the same export set for install(EXPORT) to resolve it.
+    install ( TARGETS oclelf EXPORT ${CORE_RUNTIME_NAME}Targets
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev )
+  endif()
 else()
   install ( TARGETS ${CORE_RUNTIME_TARGET} EXPORT ${CORE_RUNTIME_NAME}Targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT binary

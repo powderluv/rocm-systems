@@ -325,7 +325,7 @@ WindowsAqlQueue::WindowsAqlQueue(core::SharedQueue* shared_queue, WindowsGpuAgen
 
   status = driver_.AllocateVram(64 * 1024, 4096, &scratch_cpu_, &scratch_gpu_);
   if (status != HSA_STATUS_SUCCESS) {
-    driver_.FreeMemory(marker_cpu_base_, 4096);
+    driver_.FreeMemoryPtr(marker_cpu_base_);
     driver_.DestroyDirectComputeQueue(direct_queue_);
     core::Runtime::runtime_singleton_->system_deallocator()(ring_buf_);
     ring_buf_ = nullptr;
@@ -352,9 +352,9 @@ WindowsAqlQueue::WindowsAqlQueue(core::SharedQueue* shared_queue, WindowsGpuAgen
 
 WindowsAqlQueue::~WindowsAqlQueue() {
   WindowsAqlQueue::Inactivate();
-  if (gpu_scratch_cpu_) driver_.FreeMemory(gpu_scratch_cpu_, gpu_scratch_size_);
-  if (scratch_cpu_) driver_.FreeMemory(scratch_cpu_, scratch_size_);
-  if (marker_cpu_base_) driver_.FreeMemory(marker_cpu_base_, 4096);
+  if (gpu_scratch_cpu_) driver_.FreeMemoryPtr(gpu_scratch_cpu_);
+  if (scratch_cpu_) driver_.FreeMemoryPtr(scratch_cpu_);
+  if (marker_cpu_base_) driver_.FreeMemoryPtr(marker_cpu_base_);
   if (ring_buf_) core::Runtime::runtime_singleton_->system_deallocator()(ring_buf_);
   if (shared_queue_) core::Runtime::runtime_singleton_->system_deallocator()(shared_queue_);
 }
@@ -484,7 +484,7 @@ hsa_status_t WindowsAqlQueue::EnsureGpuScratch(size_t size) {
   uint64_t gpu = 0;
   hsa_status_t status = driver_.AllocateVram(rounded, 4096, &cpu, &gpu);
   if (status != HSA_STATUS_SUCCESS) return status;
-  if (gpu_scratch_cpu_) driver_.FreeMemory(gpu_scratch_cpu_, gpu_scratch_size_);
+  if (gpu_scratch_cpu_) driver_.FreeMemoryPtr(gpu_scratch_cpu_);
   gpu_scratch_cpu_ = cpu;
   gpu_scratch_gpu_ = gpu;
   gpu_scratch_size_ = rounded;
