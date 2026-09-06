@@ -398,11 +398,13 @@ kpack_error_t kpack_load_code_object(kpack_cache_t cache,
     return KPACK_ERROR_ARCHIVE_NOT_FOUND;
   }
 
-  // CORRECT SEARCH: arch-first, then archive
-  // For each architecture in priority order, search all archives
+  // Search requested architectures, compatible feature subsets, then paths.
+  // A pack must contain the requested module for the candidate architecture;
+  // advertising that architecture for unrelated modules is not sufficient.
   void* kernel_data = nullptr;
   size_t kernel_size = 0;
   kpack_error_t last_err = KPACK_SUCCESS;
+  bool compatible_arch_found = false;
 
   for (size_t i = 0; i < arch_count; ++i) {
     const char* arch = arch_list[i];
@@ -411,13 +413,13 @@ kpack_error_t kpack_load_code_object(kpack_cache_t cache,
     }
 
     // Try compatible targets (power set of feature flags, most specific first)
-    // to find an archive that has a matching architecture.
+    // to find an archive that has a matching module and architecture.
     KPACK_DEBUG(cache, "trying architecture: %s", arch);
 
     kpack_archive_t archive = nullptr;
     std::string matched_arch;
 
-    // Find archive containing a compatible architecture
+    // Find a module for a compatible architecture.
     // Lock only for cache lookup, release before kernel fetch
     {
       std::lock_guard<std::mutex> lock(cache->archive_mutex);
@@ -435,9 +437,20 @@ kpack_error_t kpack_load_code_object(kpack_cache_t cache,
 
           auto archive_it = cache->archives.find(archive_path);
           if (archive_it != cache->archives.end()) {
+            compatible_arch_found = true;
+            // The TOC is immutable after open, so inspecting coverage does not
+            // require kernel_mutex or decompressing unrelated payloads.
+            const auto& toc = archive_it->second->toc;
+            auto module_it = toc.find(lookup_key);
+            if (module_it == toc.end() ||
+                module_it->second.count(target) == 0) {
+              KPACK_DEBUG(cache, "  archive lacks module %s for %s",
+                          lookup_key.c_str(), target.c_str());
+              continue;
+            }
             archive = archive_it->second;
             matched_arch = target;
-            return true;  // found — stop searching
+            return true;  // first matching module wins in search-path order
           }
         }
         return false;  // try next compatible target
@@ -456,21 +469,26 @@ kpack_error_t kpack_load_code_object(kpack_cache_t cache,
       KPACK_DEBUG(cache, "  found kernel: %zu bytes", kernel_size);
       break;
     }
-    // Archive was found with matching architecture but the kernel was not
-    // present in it (e.g. an xnack-variant kpack that is missing a kernel
-    // present in the base/generic kpack). Continue to the next candidate
-    // rather than returning immediately — a less-specific but still ISA-
-    // compatible archive (e.g. bare gfx90a.kpack) may contain the kernel.
-    KPACK_DEBUG(cache, "  kernel not found in this archive (error %d), trying next candidate", err);
+    // Preserve payload error behavior: a corrupt selected payload is not
+    // masked by a duplicate in a lower-priority pack. As before, an explicitly
+    // requested alternative architecture may still supply a working payload.
+    KPACK_DEBUG(cache,
+                "  kernel fetch failed (error %d), trying next architecture",
+                err);
     last_err = err;
   }
 
   if (!kernel_data) {
-    // If we found matching archives but none contained the kernel, report
-    // KERNEL_NOT_FOUND rather than ARCH_NOT_FOUND for accurate diagnostics.
     if (last_err != KPACK_SUCCESS) {
-      KPACK_DEBUG(cache, "kernel not found in any compatible archive (last error %d)", last_err);
+      KPACK_DEBUG(cache,
+                  "kernel fetch failed in compatible archives (last error %d)",
+                  last_err);
       return last_err;
+    }
+    if (compatible_arch_found) {
+      KPACK_DEBUG(cache, "no compatible archive contains module %s",
+                  lookup_key.c_str());
+      return KPACK_ERROR_KERNEL_NOT_FOUND;
     }
     KPACK_DEBUG(cache, "no archive with compatible architecture found");
     return KPACK_ERROR_ARCH_NOT_FOUND;

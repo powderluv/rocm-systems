@@ -5,6 +5,7 @@ This script creates minimal .kpack files with known data for testing the C++
 runtime API without depending on live build artifacts.
 """
 
+import struct
 import sys
 from pathlib import Path
 
@@ -41,7 +42,7 @@ def generate_noop_archive(output_dir: Path) -> None:
     archive.add_kernel(prepared2)
 
     # Kernel 3: bin/testapp#0 @ gfx900
-    kernel3_data = b"KERNEL3_APP_GFX900" + b"\xFF" * 150
+    kernel3_data = b"KERNEL3_APP_GFX900" + b"\xff" * 150
     prepared3 = archive.prepare_kernel("bin/testapp#0", "gfx900", kernel3_data)
     archive.add_kernel(prepared3)
 
@@ -161,6 +162,72 @@ def generate_test_manifests(output_dir: Path) -> None:
     print(f"  - gfx900 only -> test_noop.kpack")
 
 
+def generate_multipack_archives(output_dir: Path) -> None:
+    """Real archives with overlapping ISAs but independently populated modules."""
+    archives = [
+        (
+            "test_multipack_a.kpack",
+            ["gfx900", "gfx906"],
+            NoOpCompressor(),
+            [
+                ("lib/first.so#0", "gfx900", b"FIRST_ONLY"),
+                ("lib/shared.so#0", "gfx900", b"FIRST_DUPLICATE"),
+                ("lib/split.so#0", "gfx906", b"FIRST_OTHER_ARCH"),
+            ],
+        ),
+        (
+            "test_multipack_b.kpack",
+            ["gfx900", "gfx906"],
+            ZstdCompressor(compression_level=3),
+            [
+                ("lib/second.so#0", "gfx900", b"SECOND_ONLY"),
+                ("lib/shared.so#0", "gfx900", b"SECOND_DUPLICATE"),
+                ("lib/shared.so#0", "gfx906", b"SECOND_PREFERRED_ARCH"),
+                ("lib/split.so#0", "gfx900", b"SECOND_REQUESTED_ARCH"),
+                ("lib/first.so#1", "gfx900", b"SECOND_CODE_OBJECT_INDEX"),
+            ],
+        ),
+        (
+            "test_multipack_feature.kpack",
+            ["gfx900:xnack+"],
+            NoOpCompressor(),
+            [
+                ("lib/unrelated.so#0", "gfx900:xnack+", b"UNRELATED_FEATURE"),
+                ("lib/shared.so#0", "gfx900:xnack+", b"SPECIFIC_DUPLICATE"),
+            ],
+        ),
+        (
+            "test_multipack_corrupt.kpack",
+            ["gfx900"],
+            ZstdCompressor(compression_level=3),
+            [("lib/shared.so#0", "gfx900", b"CORRUPT_SELECTED_PAYLOAD")],
+        ),
+    ]
+    for name, arches, compressor, kernels in archives:
+        archive = PackedKernelArchive(
+            group_name="multipack-test",
+            gfx_arch_family="gfx900X",
+            gfx_arches=arches,
+            compressor=compressor,
+        )
+        for module, arch, data in kernels:
+            archive.add_kernel(archive.prepare_kernel(module, arch, data))
+        archive.finalize_archive()
+        output_path = output_dir / name
+        archive.write(output_path)
+        if name == "test_multipack_corrupt.kpack":
+            # Keep a valid header, TOC, and compressed-frame index. Corrupt only
+            # the first Zstd frame's magic so open succeeds but fetching the
+            # selected module returns DECOMPRESSION_FAILED.
+            contents = bytearray(output_path.read_bytes())
+            toc_offset = struct.unpack_from("<Q", contents, 8)[0]
+            toc = msgpack.unpackb(contents[toc_offset:])
+            frame_offset = toc["zstd_offset"] + 8  # count and first frame size
+            contents[frame_offset : frame_offset + 4] = b"BAD!"
+            output_path.write_bytes(contents)
+        print(f"Generated multi-pack archive: {output_path}")
+
+
 def main() -> None:
     """Generate all test archives."""
     # Output to runtime/tests/test_assets
@@ -176,6 +243,8 @@ def main() -> None:
     generate_zstd_archive(output_dir)
     print()
     generate_test_manifests(output_dir)
+    print()
+    generate_multipack_archives(output_dir)
     print()
     print("Done!")
 
