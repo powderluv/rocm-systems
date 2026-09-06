@@ -6,7 +6,7 @@ This module provides the PackedKernelArchive class for creating and reading
 
 import struct
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from dataclasses import dataclass
 
 import msgpack
@@ -17,6 +17,8 @@ from .compression import (
     NoOpCompressor,
     create_compressor_from_toc,
 )
+
+PayloadType = Literal["hsaco", "cubin", "ptx", "spirv"]
 
 
 @dataclass
@@ -33,6 +35,7 @@ class PreparedKernel:
     kernel_id: str  # For debugging
     original_size: int
     metadata: dict[str, Any] | None = None
+    payload_type: PayloadType = "hsaco"
 
 
 class PackedKernelArchive:
@@ -148,6 +151,8 @@ class PackedKernelArchive:
         gfx_arch: str,
         hsaco_data: bytes,
         metadata: dict[str, Any] | None = None,
+        *,
+        payload_type: PayloadType = "hsaco",
     ) -> PreparedKernel:
         """Prepare a kernel for addition to the archive (concurrent-safe).
 
@@ -158,12 +163,16 @@ class PackedKernelArchive:
         Args:
             relative_path: Path to binary relative to install tree root
             gfx_arch: GPU architecture (e.g., "gfx1100")
-            hsaco_data: Raw HSACO kernel data
+            hsaco_data: Raw device payload (parameter name retained for compatibility)
             metadata: Optional metadata dictionary for extensibility
+            payload_type: Device payload format; defaults to legacy AMD HSACO
 
         Returns:
             PreparedKernel object to pass to add_kernel()
         """
+        if payload_type not in ("hsaco", "cubin", "ptx", "spirv"):
+            raise ValueError(f"Unsupported payload type: {payload_type!r}")
+
         # Normalize path to use forward slashes (replace backslashes)
         relative_path = relative_path.replace("\\", "/")
 
@@ -180,6 +189,7 @@ class PackedKernelArchive:
             kernel_id=kernel_id,
             original_size=len(hsaco_data),
             metadata=metadata,
+            payload_type=payload_type,
         )
 
     def add_kernel(self, prepared: PreparedKernel) -> None:
@@ -215,7 +225,7 @@ class PackedKernelArchive:
             self.toc[relative_path] = {}
 
         entry = {
-            "type": "hsaco",
+            "type": prepared.payload_type,
             "ordinal": self._kernel_ordinal_counter,
             "original_size": original_size,
         }
