@@ -629,9 +629,14 @@ hsa_status_t WindowsAqlQueue::SubmitKernel(const hsa_kernel_dispatch_packet_t& p
   // necessary but NOT sufficient without that per-queue scratch state: a
   // scratch-using kernel still faults the CP with FLAT_SCRATCH=0 (GCVM L2
   // permission fault at VA 0). Until per-queue scratch is wired (via MES
-  // submission or MQD scratch fields), the knob below defaults OFF and we reject
-  // scratch-using kernels cleanly (OUT_OF_RESOURCES) instead of wedging the GPU.
-  const bool enable_scratch = EnvEnabled("ROCR_MACOS_AQL_ENABLE_SCRATCH");
+  // submission or MQD scratch fields), the knob below rejects scratch-using
+  // kernels cleanly (OUT_OF_RESOURCES) instead of wedging the GPU when it is off.
+  // On Windows the MES path programs per-queue scratch (#62 QUEUE_SIZE fix) and
+  // the register-spilling GEMM smoke passes, so it defaults ON here; opt out
+  // with ROCR_MACOS_AQL_ENABLE_SCRATCH=0 (env name shared with the macOS queue).
+  const char* scratch_env = std::getenv("ROCR_MACOS_AQL_ENABLE_SCRATCH");
+  const bool enable_scratch =
+      scratch_env == nullptr || !(scratch_env[0] == '0' && scratch_env[1] == '\0');
   // A kernel uses scratch iff it has a nonzero per-work-item private segment.
   // gfx12 architected scratch does NOT set kPropFlatScratchInit, so don't key on
   // that. Take the larger of packet and descriptor sizes. (RSRC2.ENABLE_PRIVATE_

@@ -623,9 +623,17 @@ bool HostBlitManager::fillBuffer(device::Memory& memory, const void* pattern, si
   // host/BAR pointer is never skipped). The buffer is left un-zeroed -- valid
   // only for ops that fully overwrite it (e.g. a beta==0 GEMM workspace).
   // A GPU-side fill is the proper fix; this env-gated skip is a bring-up
-  // shortcut. Off by default.
-  static const bool kLiteSkipDevOnlyFill =
-      (getenv("ROCR_LITE_DEVICE_ONLY_SKIP_MEMSET") != nullptr);
+  // shortcut. Off by default, except on Windows where the lite:: host blit is
+  // the default and the device-only tier is reachable (the WDDM MAP_VRAM cap
+  // sends >16 MiB allocations there); opt out with =0.
+  static const bool kLiteSkipDevOnlyFill = [] {
+    const char* v = getenv("ROCR_LITE_DEVICE_ONLY_SKIP_MEMSET");
+#if defined(_WIN32)
+    return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+#else
+    return v != nullptr;
+#endif
+  }();
   if (kLiteSkipDevOnlyFill) {
     const uintptr_t fa = reinterpret_cast<uintptr_t>(fillMem);
     if (fa >= 0x8000000000ull && fa < (0x8000000000ull + (48ull << 30))) {

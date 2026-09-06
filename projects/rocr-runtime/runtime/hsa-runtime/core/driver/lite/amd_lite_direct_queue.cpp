@@ -170,18 +170,35 @@ bool EnvFlagSet(const char* name) {
   return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+// Env flag with a platform default: unset -> dflt; "0" or empty -> off; else on.
+bool EnvFlagDefault(const char* name, bool dflt) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) return dflt;
+  return value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+// Windows (WDDM passthrough, dead doorbell): the MES-backed recipe validated
+// 9/9 single-process and 9/9 per-test isolate is the default, so torch runs
+// with no env; every knob can still be turned off with =0. macOS/Linux keep
+// the opt-in defaults.
+#if defined(_WIN32)
+constexpr bool kWindowsMesDefaults = true;
+#else
+constexpr bool kWindowsMesDefaults = false;
+#endif
+
 bool MesMmioWptrPokeEnabled() {
-  return EnvFlagSet("ROCR_WINDOWS_MES_MMIO_WPTR") ||
+  return EnvFlagDefault("ROCR_WINDOWS_MES_MMIO_WPTR", kWindowsMesDefaults) ||
          EnvFlagSet("ROCR_MES_MMIO_WPTR");
 }
 
 // Windows WDDM/passthrough only: host-activate the MES scheduler ring's HQD
 // (me=3,pipe=0) with the WPTR_POLL workaround, exactly like the KIQ. Without it
 // the software MAP_SCHEDULER alone never brings pipe-0 online (rptr stays 0 and
-// the scheduler SET_HW_RESOURCES times out -> MES map status=4096). Off by
-// default so macOS/Linux (live doorbell) are unaffected.
+// the scheduler SET_HW_RESOURCES times out -> MES map status=4096). On by
+// default on Windows only; macOS/Linux (live doorbell) are unaffected.
 bool MesActivateSchedulerHqdEnabled() {
-  return EnvFlagSet("ROCR_WINDOWS_MES_ACTIVATE_SCHED_HQD");
+  return EnvFlagDefault("ROCR_WINDOWS_MES_ACTIVATE_SCHED_HQD", kWindowsMesDefaults);
 }
 
 // Windows-only: program the gfx12 SH_MEM private/scratch aperture (needed for
@@ -867,13 +884,11 @@ hsa_status_t ProgramMesQueueRegisters(const DirectQueuePlatform& platform,
   // that here for the KIQ HQD: write the enabled value instead of 0 so the
   // MES pipe's CP polls the KIQ ring's in-memory wptr
   // (CP_HQD_PQ_WPTR_POLL_ADDR/_HI = mqd[0x8D/0x8E] = layout.wptr_gpu, set
-  // below) without a doorbell event. Default (flag unset) = 0 = unchanged,
-  // so macOS/Linux behavior is identical.
+  // below) without a doorbell event. Default: on for Windows, unset = 0 =
+  // unchanged on macOS/Linux; override with ROCR_WINDOWS_MES_WPTR_POLL=0/1.
   uint32_t mes_wptr_poll_cntl = 0;
   {
-    const char* poll_env = std::getenv("ROCR_WINDOWS_MES_WPTR_POLL");
-    if (poll_env != nullptr && poll_env[0] != '\0' &&
-        std::strcmp(poll_env, "0") != 0) {
+    if (EnvFlagDefault("ROCR_WINDOWS_MES_WPTR_POLL", kWindowsMesDefaults)) {
       // 0x1 = the enabled value the working direct queue runs with (the
       // firmware default CreateDirectQueue leaves untouched; dbprobe saw 0x1).
       mes_wptr_poll_cntl = 0x1u;

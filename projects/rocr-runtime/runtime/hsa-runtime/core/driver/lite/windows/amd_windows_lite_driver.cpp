@@ -146,15 +146,20 @@ lite::DirectQueueOptions WindowsDirectQueueOptions() {
   options.use_firmware_dequeue = true;
   options.trace = TraceDirectQueue();
   options.trace_verbose = TraceDirectQueueVerbose();
-  // First pass: direct HQD, no MES. Matches the pre-MES macOS/Linux bring-up.
-  options.use_mes_queue = std::getenv("ROCR_WINDOWS_USE_MES_QUEUE") != nullptr;
+  // Windows default = the MES-backed queue (the WDDM doorbell is dead, so the
+  // direct HQD path cannot create a queue); opt out with =0.
+  const auto env_default_on = [](const char* name) {
+    const char* v = std::getenv(name);
+    return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+  };
+  options.use_mes_queue = env_default_on("ROCR_WINDOWS_USE_MES_QUEUE");
   // Without a KMD to reset queues on process exit, an HQD activated by a
   // prior process stays active across runs (and the bring-up deliberately
   // skips re-bootload for repeatability). Reclaim a stale active HQD on a
   // fresh queue create, mirroring macOS (AMD_GPU_MACOS_FORCE_DIRECT_COMPUTE)
   // and Linux (ROCR_AMDGPU_LITE_FORCE_DIRECT_COMPUTE).
-  options.force_reclaim =
-      std::getenv("ROCR_WINDOWS_FORCE_DIRECT_COMPUTE") != nullptr;
+  // Default on (parity with the validated recipe; a no-op on the MES path).
+  options.force_reclaim = env_default_on("ROCR_WINDOWS_FORCE_DIRECT_COMPUTE");
   options.trace_prefix = "ROCR windows direct queue";
   return options;
 }

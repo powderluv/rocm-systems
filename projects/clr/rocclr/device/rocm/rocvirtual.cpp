@@ -2468,6 +2468,14 @@ bool VirtualGPU::create() {
   const bool force_host_blit =
 #if defined(__APPLE__)
       std::getenv("ROCR_MACOS_HOST_BLIT_ONLY") != nullptr;
+#elif defined(_WIN32)
+      // lite:: on Windows: host-side copies by default. The shader copy path
+      // writes small pinned-host destinations through an untranslated host VA
+      // (silent zeros on readback). Opt out with ROCR_AMDGPU_LITE_HOST_BLIT_ONLY=0.
+      [] {
+        const char* v = std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT_ONLY");
+        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+      }();
 #else
       std::getenv("ROCR_AMDGPU_LITE_HOST_BLIT_ONLY") != nullptr;
 #endif
